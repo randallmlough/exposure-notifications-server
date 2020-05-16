@@ -41,7 +41,7 @@ func TestInvalidNew(t *testing.T) {
 	}
 
 	for i, c := range cases {
-		_, err := NewTransformer(c.maxKeys, time.Hour)
+		_, err := NewTransformer(c.maxKeys, time.Hour, time.Hour)
 		if err != nil && errMsg == "" {
 			t.Errorf("%v unexpected error: %v", i, err)
 		} else if err != nil && !strings.Contains(err.Error(), c.message) {
@@ -51,7 +51,7 @@ func TestInvalidNew(t *testing.T) {
 }
 
 func TestInvalidBase64(t *testing.T) {
-	transformer, err := NewTransformer(1, time.Hour*24)
+	transformer, err := NewTransformer(1, time.Hour*24, time.Hour)
 	if err != nil {
 		t.Fatalf("error creating transformer: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestPublishValidation(t *testing.T) {
 	currentInterval := IntervalNumber(captureStartTime)
 	minInterval := IntervalNumber(captureStartTime.Add(-1 * maxAge))
 
-	tf, err := NewTransformer(2, maxAge)
+	tf, err := NewTransformer(2, maxAge, time.Hour)
 	if err != nil {
 		t.Fatalf("unepected error: %v", err)
 	}
@@ -144,11 +144,11 @@ func TestPublishValidation(t *testing.T) {
 						Key:              encodeKey(generateKey(t)),
 						IntervalNumber:   currentInterval - 2,
 						IntervalCount:    1,
-						TransmissionRisk: minTransmissionRisk - 1,
+						TransmissionRisk: MinTransmissionRisk - 1,
 					},
 				},
 			},
-			m: fmt.Sprintf("invalid transmission risk: %v, must be >= %v && <= %v", minTransmissionRisk-1, minTransmissionRisk, maxTransmissionRisk),
+			m: fmt.Sprintf("invalid transmission risk: %v, must be >= %v && <= %v", MinTransmissionRisk-1, MinTransmissionRisk, MaxTransmissionRisk),
 		},
 		{
 			name: "tranismission risk too high",
@@ -158,21 +158,20 @@ func TestPublishValidation(t *testing.T) {
 						Key:              encodeKey(generateKey(t)),
 						IntervalNumber:   currentInterval - 2,
 						IntervalCount:    1,
-						TransmissionRisk: maxTransmissionRisk + 1,
+						TransmissionRisk: MaxTransmissionRisk + 1,
 					},
 				},
 			},
-			m: fmt.Sprintf("invalid transmission risk: %v, must be >= %v && <= %v", maxTransmissionRisk+1, minTransmissionRisk, maxTransmissionRisk),
+			m: fmt.Sprintf("invalid transmission risk: %v, must be >= %v && <= %v", MaxTransmissionRisk+1, MinTransmissionRisk, MaxTransmissionRisk),
 		},
 		{
 			name: "key length too short",
 			p: &Publish{
 				Keys: []ExposureKey{
-					{Key: encodeKey(generateKey(t)[0 : keyLength-2])},
+					{Key: encodeKey(generateKey(t)[0 : KeyLength-2])},
 				},
-				TransmissionRisk: maxTransmissionRisk - 1,
 			},
-			m: fmt.Sprintf("invalid key length, %v, must be %v", keyLength-2, keyLength),
+			m: fmt.Sprintf("invalid key length, %v, must be %v", KeyLength-2, KeyLength),
 		},
 		{
 			name: "interval count too small",
@@ -180,12 +179,11 @@ func TestPublishValidation(t *testing.T) {
 				Keys: []ExposureKey{
 					{
 						Key:           encodeKey(generateKey(t)),
-						IntervalCount: minIntervalCount - 1,
+						IntervalCount: MinIntervalCount - 1,
 					},
 				},
-				TransmissionRisk: maxTransmissionRisk - 1,
 			},
-			m: fmt.Sprintf("invalid interval count, %v, must be >= %v && <= %v", minIntervalCount-1, minIntervalCount, maxIntervalCount),
+			m: fmt.Sprintf("invalid interval count, %v, must be >= %v && <= %v", MinIntervalCount-1, MinIntervalCount, MaxIntervalCount),
 		},
 		{
 			name: "interval count too high",
@@ -193,12 +191,11 @@ func TestPublishValidation(t *testing.T) {
 				Keys: []ExposureKey{
 					{
 						Key:           encodeKey(generateKey(t)),
-						IntervalCount: maxIntervalCount + 1,
+						IntervalCount: MaxIntervalCount + 1,
 					},
 				},
-				TransmissionRisk: maxTransmissionRisk - 1,
 			},
-			m: fmt.Sprintf("invalid interval count, %v, must be >= %v && <= %v", maxIntervalCount+1, minIntervalCount, maxIntervalCount),
+			m: fmt.Sprintf("invalid interval count, %v, must be >= %v && <= %v", MaxIntervalCount+1, MinIntervalCount, MaxIntervalCount),
 		},
 		{
 			name: "interval number too low",
@@ -207,10 +204,9 @@ func TestPublishValidation(t *testing.T) {
 					{
 						Key:            encodeKey(generateKey(t)),
 						IntervalNumber: minInterval - 1,
-						IntervalCount:  maxIntervalCount,
+						IntervalCount:  MaxIntervalCount,
 					},
 				},
-				TransmissionRisk: maxTransmissionRisk - 1,
 			},
 			m: fmt.Sprintf("interval number %v is too old, must be >= %v", minInterval-1, minInterval),
 		},
@@ -224,7 +220,6 @@ func TestPublishValidation(t *testing.T) {
 						IntervalCount:  1,
 					},
 				},
-				TransmissionRisk: maxTransmissionRisk - 1,
 			},
 			m: fmt.Sprintf("interval number %v is in the future, must be < %v", currentInterval+1, currentInterval),
 		},
@@ -270,60 +265,67 @@ func TestTransform(t *testing.T) {
 	source := &Publish{
 		Keys: []ExposureKey{
 			{
-				Key:            encodeKey(generateKey(t)),
-				IntervalNumber: intervalNumber,
-				IntervalCount:  maxIntervalCount,
+				Key:              encodeKey(generateKey(t)),
+				IntervalNumber:   intervalNumber,
+				IntervalCount:    MaxIntervalCount,
+				TransmissionRisk: 1,
 			},
 			{
-				Key:            encodeKey(generateKey(t)),
-				IntervalNumber: intervalNumber + maxIntervalCount,
-				IntervalCount:  maxIntervalCount,
+				Key:              encodeKey(generateKey(t)),
+				IntervalNumber:   intervalNumber + MaxIntervalCount,
+				IntervalCount:    MaxIntervalCount,
+				TransmissionRisk: 2,
 			},
 			{
-				Key:            encodeKey(generateKey(t)),
-				IntervalNumber: intervalNumber + 2*maxIntervalCount,
-				IntervalCount:  maxIntervalCount, // Invalid, should get rounded down
+				Key:              encodeKey(generateKey(t)),
+				IntervalNumber:   intervalNumber + 2*MaxIntervalCount,
+				IntervalCount:    MaxIntervalCount, // Invalid, should get rounded down
+				TransmissionRisk: 3,
 			},
 			{
-				Key:            encodeKey(generateKey(t)),
-				IntervalNumber: intervalNumber + 3*maxIntervalCount,
-				IntervalCount:  42,
+				Key:              encodeKey(generateKey(t)),
+				IntervalNumber:   intervalNumber + 3*MaxIntervalCount,
+				IntervalCount:    42,
+				TransmissionRisk: 4,
 			},
 		},
-		Regions:          []string{"us", "cA", "Mx"}, // will be upcased
-		AppPackageName:   "com.google",
-		TransmissionRisk: 2,
+		Regions:        []string{"us", "cA", "Mx"}, // will be upcased
+		AppPackageName: "com.google",
 		// Verification doesn't matter for transforming.
 	}
 
 	want := []*Exposure{
 		{
-			ExposureKey:    decodeKey(source.Keys[0].Key, t),
-			IntervalNumber: intervalNumber,
-			IntervalCount:  maxIntervalCount,
+			ExposureKey:      decodeKey(source.Keys[0].Key, t),
+			IntervalNumber:   intervalNumber,
+			IntervalCount:    MaxIntervalCount,
+			TransmissionRisk: 1,
 		},
 		{
-			ExposureKey:    decodeKey(source.Keys[1].Key, t),
-			IntervalNumber: intervalNumber + maxIntervalCount,
-			IntervalCount:  maxIntervalCount,
+			ExposureKey:      decodeKey(source.Keys[1].Key, t),
+			IntervalNumber:   intervalNumber + MaxIntervalCount,
+			IntervalCount:    MaxIntervalCount,
+			TransmissionRisk: 2,
 		},
 		{
-			ExposureKey:    decodeKey(source.Keys[2].Key, t),
-			IntervalNumber: intervalNumber + 2*maxIntervalCount,
-			IntervalCount:  maxIntervalCount,
+			ExposureKey:      decodeKey(source.Keys[2].Key, t),
+			IntervalNumber:   intervalNumber + 2*MaxIntervalCount,
+			IntervalCount:    MaxIntervalCount,
+			TransmissionRisk: 3,
 		},
 		{
-			ExposureKey:    decodeKey(source.Keys[3].Key, t),
-			IntervalNumber: intervalNumber + 3*maxIntervalCount,
-			IntervalCount:  42,
+			ExposureKey:      decodeKey(source.Keys[3].Key, t),
+			IntervalNumber:   intervalNumber + 3*MaxIntervalCount,
+			IntervalCount:    42,
+			TransmissionRisk: 4,
 		},
 	}
 	batchTime := captureStartTime.Add(time.Hour * 24 * 7)
-	batchTimeRounded := TruncateWindow(batchTime)
+	batchTimeRounded := TruncateWindow(batchTime, time.Hour)
 	for i, v := range want {
 		want[i] = &Exposure{
 			ExposureKey:      v.ExposureKey,
-			TransmissionRisk: 2,
+			TransmissionRisk: i + 1,
 			AppPackageName:   "com.google",
 			Regions:          []string{"US", "CA", "MX"},
 			IntervalNumber:   v.IntervalNumber,
@@ -334,7 +336,7 @@ func TestTransform(t *testing.T) {
 	}
 
 	allowedAge := 14 * 24 * time.Hour
-	transformer, err := NewTransformer(10, allowedAge)
+	transformer, err := NewTransformer(10, allowedAge, time.Hour)
 	if err != nil {
 		t.Fatalf("NewTransformer returned unexpected error: %v", err)
 	}
@@ -365,17 +367,16 @@ func TestTransformOverlapping(t *testing.T) {
 					{
 						Key:            encodeKey(generateKey(t)),
 						IntervalNumber: intervalNumber,
-						IntervalCount:  maxIntervalCount,
+						IntervalCount:  MaxIntervalCount,
 					},
 					{
 						Key:            encodeKey(generateKey(t)),
-						IntervalNumber: intervalNumber + maxIntervalCount - 2,
-						IntervalCount:  maxIntervalCount,
+						IntervalNumber: intervalNumber + MaxIntervalCount - 2,
+						IntervalCount:  MaxIntervalCount,
 					},
 				},
-				Regions:          []string{"us", "cA", "Mx"}, // will be upcased
-				AppPackageName:   "com.google",
-				TransmissionRisk: 2,
+				Regions:        []string{"us", "cA", "Mx"}, // will be upcased
+				AppPackageName: "com.google",
 			},
 		},
 		{
@@ -385,17 +386,16 @@ func TestTransformOverlapping(t *testing.T) {
 					{
 						Key:            encodeKey(generateKey(t)),
 						IntervalNumber: intervalNumber,
-						IntervalCount:  maxIntervalCount,
+						IntervalCount:  MaxIntervalCount,
 					},
 					{
 						Key:            encodeKey(generateKey(t)),
-						IntervalNumber: intervalNumber - maxIntervalCount + 1,
-						IntervalCount:  maxIntervalCount,
+						IntervalNumber: intervalNumber - MaxIntervalCount + 1,
+						IntervalCount:  MaxIntervalCount,
 					},
 				},
-				Regions:          []string{"us", "cA", "Mx"}, // will be upcased
-				AppPackageName:   "com.google",
-				TransmissionRisk: 2,
+				Regions:        []string{"us", "cA", "Mx"}, // will be upcased
+				AppPackageName: "com.google",
 			},
 		},
 	}
@@ -404,7 +404,7 @@ func TestTransformOverlapping(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			batchTime := captureStartTime.Add(time.Hour * 24 * 7)
 			allowedAge := 14 * 24 * time.Hour
-			transformer, err := NewTransformer(10, allowedAge)
+			transformer, err := NewTransformer(10, allowedAge, time.Hour)
 			if err != nil {
 				t.Fatalf("NewTransformer returned unexpected error: %v", err)
 			}

@@ -28,22 +28,19 @@ const (
 	maxKeysPerPublish = 21
 
 	// only valid exposure key keyLength
-	keyLength = 16
+	KeyLength = 16
 
 	// Transmission risk constraints (inclusive..inclusive)
-	minTransmissionRisk = 0 // 0 indicates, no/unknown risk.
-	maxTransmissionRisk = 8
+	MinTransmissionRisk = 0 // 0 indicates, no/unknown risk.
+	MaxTransmissionRisk = 8
 
 	// Intervals are defined as 10 minute periods, there are 144 of them in a day.
 	// IntervalCount constraints (inclusive..inclusive)
-	minIntervalCount = 1
-	maxIntervalCount = 144
+	MinIntervalCount = 1
+	MaxIntervalCount = 144
 
 	// Self explanitory.
 	oneDay = time.Hour * 24
-	// Alignment window for requests. The created_at time for an exposure
-	// record is rounded down to the beginning of the createWindow.
-	createWindow = time.Hour
 
 	// interval length
 	intervalLength = 10 * time.Minute
@@ -67,7 +64,6 @@ type Publish struct {
 	Regions                   []string      `json:"regions"`
 	AppPackageName            string        `json:"appPackageName"`
 	Platform                  string        `json:"platform"`
-	TransmissionRisk          int           `json:"transmissionRisk"` // DEPRECATED
 	DeviceVerificationPayload string        `json:"deviceVerificationPayload"`
 	VerificationPayload       string        `json:"verificationPayload"`
 	Padding                   string        `json:"padding"`
@@ -119,26 +115,28 @@ func IntervalNumber(t time.Time) int32 {
 }
 
 // TruncateWindow truncates a time based on the size of the creation window.
-func TruncateWindow(t time.Time) time.Time {
-	return t.Truncate(createWindow)
+func TruncateWindow(t time.Time, d time.Duration) time.Time {
+	return t.Truncate(d)
 }
 
 // Transformer represents a configured Publish -> Exposure[] transformer.
 type Transformer struct {
 	maxExposureKeys     int
 	maxIntervalStartAge time.Duration // How many intervals old does this server accept?
+	truncateWindow      time.Duration
 }
 
 // NewTransformer creates a transformer for turning publish API requests into
 // records for insertion into the database. On the call to TransofmrPublish
 // all data is validated according to the transformer that is used.
-func NewTransformer(maxExposureKeys int, maxIntervalStartAge time.Duration) (*Transformer, error) {
+func NewTransformer(maxExposureKeys int, maxIntervalStartAge time.Duration, truncateWindow time.Duration) (*Transformer, error) {
 	if maxExposureKeys < 0 || maxExposureKeys > maxKeysPerPublish {
 		return nil, fmt.Errorf("maxExposureKeys must be > 0 and <= %v, got %v", maxKeysPerPublish, maxExposureKeys)
 	}
 	return &Transformer{
 		maxExposureKeys:     maxExposureKeys,
 		maxIntervalStartAge: maxIntervalStartAge,
+		truncateWindow:      truncateWindow,
 	}, nil
 }
 
@@ -158,7 +156,7 @@ func (t *Transformer) TransformPublish(inData *Publish, batchTime time.Time) ([]
 		return nil, fmt.Errorf("too many exposure keys in publish: %v, max of %v is allowed", len(inData.Keys), t.maxExposureKeys)
 	}
 
-	createdAt := TruncateWindow(batchTime)
+	createdAt := TruncateWindow(batchTime, t.truncateWindow)
 	entities := make([]*Exposure, 0, len(inData.Keys))
 
 	// An exposure key must have an interval >= minInteravl (max configured age)
@@ -175,13 +173,6 @@ func (t *Transformer) TransformPublish(inData *Publish, batchTime time.Time) ([]
 		upcaseRegions[i] = strings.ToUpper(r)
 	}
 
-	// Transmission risk for the whole batch is deprecated - it is now part
-	// of the ExposureKey.
-	defaultTR := inData.TransmissionRisk
-	if defaultTR < minTransmissionRisk || defaultTR > maxTransmissionRisk {
-		return nil, fmt.Errorf("invalid transmission risk: %v, must be >= %v && <= %v", defaultTR, minTransmissionRisk, maxTransmissionRisk)
-	}
-
 	for _, exposureKey := range inData.Keys {
 		binKey, err := base64util.DecodeString(exposureKey.Key)
 		if err != nil {
@@ -189,11 +180,11 @@ func (t *Transformer) TransformPublish(inData *Publish, batchTime time.Time) ([]
 		}
 
 		// Validate individual pieces of this publish request.
-		if len(binKey) != keyLength {
-			return nil, fmt.Errorf("invalid key length, %v, must be %v", len(binKey), keyLength)
+		if len(binKey) != KeyLength {
+			return nil, fmt.Errorf("invalid key length, %v, must be %v", len(binKey), KeyLength)
 		}
-		if ic := exposureKey.IntervalCount; ic < minIntervalCount || ic > maxIntervalCount {
-			return nil, fmt.Errorf("invalid interval count, %v, must be >= %v && <= %v", ic, minIntervalCount, maxIntervalCount)
+		if ic := exposureKey.IntervalCount; ic < MinIntervalCount || ic > MaxIntervalCount {
+			return nil, fmt.Errorf("invalid interval count, %v, must be >= %v && <= %v", ic, MinIntervalCount, MaxIntervalCount)
 		}
 
 		// Validate the IntervalNumber.
@@ -204,18 +195,13 @@ func (t *Transformer) TransformPublish(inData *Publish, batchTime time.Time) ([]
 			return nil, fmt.Errorf("interval number %v is in the future, must be < %v", exposureKey.IntervalNumber, maxIntervalNumber)
 		}
 
-		tr := exposureKey.TransmissionRisk
-		// This is temporary - while we reprecate per-request tranismission risk
-		if tr == 0 && defaultTR != 0 {
-			tr = defaultTR
-		}
-		if tr < minTransmissionRisk || tr > maxTransmissionRisk {
-			return nil, fmt.Errorf("invalid transmission risk: %v, must be >= %v && <= %v", tr, minTransmissionRisk, maxTransmissionRisk)
+		if tr := exposureKey.TransmissionRisk; tr < MinTransmissionRisk || tr > MaxTransmissionRisk {
+			return nil, fmt.Errorf("invalid transmission risk: %v, must be >= %v && <= %v", tr, MinTransmissionRisk, MaxTransmissionRisk)
 		}
 
 		exposure := &Exposure{
 			ExposureKey:      binKey,
-			TransmissionRisk: tr,
+			TransmissionRisk: exposureKey.TransmissionRisk,
 			AppPackageName:   inData.AppPackageName,
 			Regions:          upcaseRegions,
 			IntervalNumber:   exposureKey.IntervalNumber,
