@@ -32,7 +32,7 @@ All submissions will be reviewed before merging. Submissions are reviewed using
 
 ### Source code layout
 
-Common code is in the `/pkg` folder.
+Common code is in the `/internal` folder.
 
 Each binary will have its `main.go` file in a `/cmd/[bin-name]` folder.
 
@@ -52,41 +52,10 @@ Run the tests with:
 $ go test ./...
 ```
 
-To run tests that interact with the database:
-
-1.  Set up the environment:
-
-    ```text
-    $ eval $(./scripts/dev init)
-    ```
-
-1.  Start a local database instance:
-
-    ```text
-    $ ./scripts/dev dbstart
-    ```
-
-1.  Run the tests:
-
-    ```text
-    $ go test -v ./...
-    ```
-
-
 ### Presubmit checks
 
 You should run the presubmit checks before committing changes. The presubmit script
 is located at `scripts/presubmit.sh`.
-
-You can add a prepush hook by linking to the presubmit script to automatically
-run before pushing a branch to the remote GitHub repository. To add the
-presubmit script as a prepush hook, go to the root directory of the repository
-and type:
-
-```
-ln -s -f ../../scripts/presubmit.sh .git/hooks/pre-push
-chmod a+x .git/hooks/pre-push
-```
 
 ### Running locally
 
@@ -100,7 +69,7 @@ Docker is installed and available in your `$PATH`.
     $ eval $(./scripts/dev init)
     ```
 
-    **If you close your terminal tab or session, you will need to re-run this
+    **If you close your terminal tab or session, you need to re-run this
     command.**
 
 1.  Create the local development database:
@@ -129,13 +98,6 @@ Docker is installed and available in your `$PATH`.
 
     ```text
     $ go run ./cmd/exposure/...
-    ```
-
-    Alternatively, you can run all the server components as a single binary with
-    each component at a different path:
-
-    ```text
-    $ go run ./cmd/monolith/...
     ```
 
 1.  When you're done developing, you can stop the database.

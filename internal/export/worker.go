@@ -17,6 +17,7 @@ package export
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"net/http"
@@ -24,9 +25,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/database"
+	coredb "github.com/google/exposure-notifications-server/internal/database"
+	exportdatabase "github.com/google/exposure-notifications-server/internal/export/database"
+	publishdatabase "github.com/google/exposure-notifications-server/internal/publish/database"
+
+	"github.com/google/exposure-notifications-server/internal/export/model"
+	publishmodel "github.com/google/exposure-notifications-server/internal/publish/model"
+
 	"github.com/google/exposure-notifications-server/internal/logging"
-	"github.com/google/exposure-notifications-server/internal/model"
+	"github.com/google/exposure-notifications-server/internal/util"
+
+	verifyapi "github.com/google/exposure-notifications-server/pkg/api/v1alpha1"
 )
 
 const (
@@ -34,75 +43,74 @@ const (
 	blobOperationTimeout = 50 * time.Second
 )
 
-// WorkerHandler is a handler to iterate the rows of ExportBatch, and creates GCS files.
-func (s *Server) WorkerHandler(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), s.config.WorkerTimeout)
-	defer cancel()
+// handleDoWork is a handler to iterate the rows of ExportBatch, and creates
+// export files.
+func (s *Server) handleDoWork(ctx context.Context) http.HandlerFunc {
 	logger := logging.FromContext(ctx)
+	db := s.env.Database()
 
-	emitIndexForEmptyBatch := true
-	for {
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != context.DeadlineExceeded && err != context.Canceled {
-				logger.Errorf("Context error while processing batches: %v", err)
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), s.config.WorkerTimeout)
+		defer cancel()
+
+		emitIndexForEmptyBatch := true
+		for {
+			if ctx.Err() != nil {
+				msg := "Timed out processing batches. Will continue on next invocation."
+				logger.Info(msg)
+				fmt.Fprintln(w, msg)
 				return
 			}
-			msg := "Timed out processing batches. Will continue on next invocation."
-			logger.Info(msg)
-			fmt.Fprintln(w, msg)
-			return
-		default:
-			// Fallthrough
-		}
 
-		// Only consider batches that closed a few minutes ago to allow the publish windows to close properly.
-		minutesAgo := time.Now().Add(-5 * time.Minute)
+			// Check for a batch and obtain a lease for it.
+			batch, err := exportdatabase.New(db).LeaseBatch(ctx, s.config.WorkerTimeout, time.Now())
+			if err != nil {
+				logger.Errorf("Failed to lease batch: %v", err)
+				continue
+			}
+			if batch == nil {
+				msg := "No more work to do"
+				logger.Info(msg)
+				fmt.Fprintln(w, msg)
+				return
+			}
 
-		// Check for a batch and obtain a lease for it.
-		batch, err := s.db.LeaseBatch(ctx, s.config.WorkerTimeout, minutesAgo)
-		if err != nil {
-			logger.Errorf("Failed to lease batch: %v", err)
-			continue
-		}
-		if batch == nil {
-			msg := "No more work to do"
-			logger.Info(msg)
-			fmt.Fprintln(w, msg)
-			return
-		}
+			if err = s.exportBatch(ctx, batch, emitIndexForEmptyBatch); err != nil {
+				logger.Errorf("Failed to create files for batch: %v.", err)
+				continue
+			}
+			// We re-write the index file for empty batches for self-healing so that the
+			// index file reflects the ExportFile table in database. However, if a
+			// single worker processes a number of empty batches quickly, we want to
+			// avoid writing the same file repeatedly and hitting a rate limit.
+			emitIndexForEmptyBatch = false
 
-		if err = s.exportBatch(ctx, batch, emitIndexForEmptyBatch); err != nil {
-			logger.Errorf("Failed to create files for batch: %v.", err)
-			continue
+			fmt.Fprintf(w, "Batch %d marked completed. \n", batch.BatchID)
 		}
-		// We re-write the index file for empty batches for self-healing so that the index
-		// file reflects the ExportFile table in database. However, if a single worker
-		// processes a number of empty batches quickly, we want to avoid writing the same
-		// file repeatedly and hitting a rate limit.
-		emitIndexForEmptyBatch = false
-
-		fmt.Fprintf(w, "Batch %d marked completed. \n", batch.BatchID)
 	}
 }
 
 func (s *Server) exportBatch(ctx context.Context, eb *model.ExportBatch, emitIndexForEmptyBatch bool) error {
 	logger := logging.FromContext(ctx)
-	logger.Infof("Processing export batch %d (root: %q, region: %s), max records per file %d", eb.BatchID, eb.FilenameRoot, eb.Region, s.config.MaxRecords)
+	db := s.env.Database()
 
-	criteria := database.IterateExposuresCriteria{
+	logger.Infof("Processing export batch %d (root: %q, region: %s), max records per file %d", eb.BatchID, eb.FilenameRoot, eb.OutputRegion, s.config.MaxRecords)
+
+	criteria := publishdatabase.IterateExposuresCriteria{
 		SinceTimestamp:      eb.StartTimestamp,
 		UntilTimestamp:      eb.EndTimestamp,
-		IncludeRegions:      []string{eb.Region},
+		IncludeRegions:      eb.EffectiveInputRegions(),
 		OnlyLocalProvenance: false, // include federated ids
 	}
 
-	// Build up groups of exposures in memory. We need to use memory so we can determine the
-	// total number of groups (which is embedded in each export file). This technique avoids
-	// SELECT COUNT which would lock the database slowing new uploads.
-	var groups [][]*model.Exposure
-	var exposures []*model.Exposure
-	_, err := s.db.IterateExposures(ctx, criteria, func(exp *model.Exposure) error {
+	// Build up groups of exposures in memory. We need to use memory so we can
+	// determine the total number of groups (which is embedded in each export
+	// file). This technique avoids SELECT COUNT which would lock the database
+	// slowing new uploads.
+	var groups [][]*publishmodel.Exposure
+	var exposures []*publishmodel.Exposure
+
+	_, err := publishdatabase.New(db).IterateExposures(ctx, criteria, func(exp *publishmodel.Exposure) error {
 		exposures = append(exposures, exp)
 		if len(exposures) == s.config.MaxRecords {
 			groups = append(groups, exposures)
@@ -110,6 +118,7 @@ func (s *Server) exportBatch(ctx context.Context, eb *model.ExportBatch, emitInd
 		}
 		return nil
 	})
+
 	if err != nil {
 		return fmt.Errorf("iterating exposures: %w", err)
 	}
@@ -122,28 +131,36 @@ func (s *Server) exportBatch(ctx context.Context, eb *model.ExportBatch, emitInd
 		logger.Infof("No records for export batch %d", eb.BatchID)
 	}
 
-	exposures, err = ensureMinNumExposures(exposures, eb.Region, s.config.MinRecords, s.config.PaddingRange)
+	exposures, err = ensureMinNumExposures(exposures, eb.OutputRegion, s.config.MinRecords, s.config.PaddingRange)
 	if err != nil {
 		return fmt.Errorf("ensureMinNumExposures: %w", err)
+	}
+
+	// Load the non-expired signature infos associated with this export batch.
+	sigInfos, err := exportdatabase.New(db).LookupSignatureInfos(ctx, eb.SignatureInfoIDs, time.Now())
+	if err != nil {
+		return fmt.Errorf("error loading signature info for batch %d, %w", eb.BatchID, err)
 	}
 
 	// Create the export files.
 	batchSize := len(groups)
 	var objectNames []string
 	for i, exposures := range groups {
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != context.DeadlineExceeded && err != context.Canceled {
-				return err
-			}
+		if ctx.Err() != nil {
 			logger.Infof("Timed out writing export files for batch %s, the entire batch will be retried once the batch lease expires on %v", eb.BatchID, eb.LeaseExpires)
 			return nil
-		default:
-			// Fallthrough
 		}
 
-		// TODO(squee1945): Uploading in parallel (to a point) probably makes better use of network.
-		objectName, err := s.createFile(ctx, exposures, eb, i+1, batchSize)
+		// TODO(squee1945): Uploading in parallel (to a point) probably makes better
+		// use of network.
+		objectName, err := s.createFile(ctx,
+			createFileInfo{
+				exposures:      exposures,
+				exportBatch:    eb,
+				signatureInfos: sigInfos,
+				batchNum:       i + 1,
+				batchSize:      batchSize,
+			})
 		if err != nil {
 			return fmt.Errorf("creating export file %d for batch %d: %w", i+1, eb.BatchID, err)
 		}
@@ -159,58 +176,67 @@ func (s *Server) exportBatch(ctx context.Context, eb *model.ExportBatch, emitInd
 	}
 
 	// Write the files records in database and complete the batch.
-	if err := s.db.FinalizeBatch(ctx, eb, objectNames, batchSize); err != nil {
+	if err := exportdatabase.New(db).FinalizeBatch(ctx, eb, objectNames, batchSize); err != nil {
 		return fmt.Errorf("completing batch: %w", err)
 	}
 	logger.Infof("Batch %d completed", eb.BatchID)
 	return nil
 }
 
-func (s *Server) createFile(ctx context.Context, exposures []*model.Exposure, eb *model.ExportBatch, batchNum, batchSize int) (string, error) {
+type createFileInfo struct {
+	exposures      []*publishmodel.Exposure
+	exportBatch    *model.ExportBatch
+	signatureInfos []*model.SignatureInfo
+	batchNum       int
+	batchSize      int
+}
+
+func (s *Server) createFile(ctx context.Context, cfi createFileInfo) (string, error) {
 	logger := logging.FromContext(ctx)
-	signer, err := s.env.GetSignerForKey(ctx, eb.SigningKey)
-	if err != nil {
-		return "", fmt.Errorf("unable to get signer for key %v: %w", eb.SigningKey, err)
-	}
-	// Generate exposure key export file.
-	data, err := MarshalExportFile(eb, exposures, batchNum, batchSize, signer, s.config.DefaultKeyID, s.config.DefaultKeyVersion)
-	if err != nil {
-		return "", fmt.Errorf("marshalling export file: %w", err)
+
+	var signers []*Signer
+	for _, si := range cfi.signatureInfos {
+		signer, err := s.env.GetSignerForKey(ctx, si.SigningKey)
+		if err != nil {
+			return "", fmt.Errorf("unable to get signer for key %v: %w", si.SigningKey, err)
+		}
+		signers = append(signers, &Signer{SignatureInfo: si, Signer: signer})
 	}
 
-	// Write to GCS.
-	objectName := exportFilename(eb, batchNum)
-	logger.Infof("Created file %v, signed with key %v", objectName, eb.SigningKey)
+	// Generate exposure key export file.
+	data, err := MarshalExportFile(cfi.exportBatch, cfi.exposures, cfi.batchNum, cfi.batchSize, signers)
+	if err != nil {
+		return "", fmt.Errorf("marshaling export file: %w", err)
+	}
+
+	objectName := exportFilename(cfi.exportBatch, cfi.batchNum)
+	logger.Infof("Created file %v, signed with %v keys", objectName, len(signers))
 	ctx, cancel := context.WithTimeout(ctx, blobOperationTimeout)
 	defer cancel()
-	if err := s.env.Blobstore().CreateObject(ctx, eb.BucketName, objectName, data); err != nil {
-		return "", fmt.Errorf("creating file %s in bucket %s: %w", objectName, eb.BucketName, err)
+	if err := s.env.Blobstore().CreateObject(ctx, cfi.exportBatch.BucketName, objectName, data, false); err != nil {
+		return "", fmt.Errorf("creating file %s in bucket %s: %w", objectName, cfi.exportBatch.BucketName, err)
 	}
 	return objectName, nil
 }
 
-// retryingCreateIndex create the index file. The index file includes _all_ batches for an ExportConfig,
-// so multiple workers may be racing to update it. We use a lock to make them line up after one another.
+// retryingCreateIndex create the index file. The index file includes _all_
+// batches for an ExportConfig, so multiple workers may be racing to update it.
+// We use a lock to make them line up after one another.
 func (s *Server) retryingCreateIndex(ctx context.Context, eb *model.ExportBatch, objectNames []string) error {
 	logger := logging.FromContext(ctx)
+	db := s.env.Database()
 
 	lockID := fmt.Sprintf("export-batch-%d", eb.BatchID)
 	sleep := 10 * time.Second
 	for {
-		select {
-		case <-ctx.Done():
-			if err := ctx.Err(); err != context.DeadlineExceeded && err != context.Canceled {
-				return err
-			}
+		if ctx.Err() != nil {
 			logger.Infof("Timed out acquiring index file lock for batch %s, the entire batch will be retried once the batch lease expires on %v", eb.BatchID, eb.LeaseExpires)
 			return nil
-		default:
-			// Fallthrough
 		}
 
-		unlock, err := s.db.Lock(ctx, lockID, time.Minute)
+		unlock, err := db.Lock(ctx, lockID, time.Minute)
 		if err != nil {
-			if err == database.ErrAlreadyLocked {
+			if errors.Is(err, coredb.ErrAlreadyLocked) {
 				logger.Debugf("Lock %s is locked; sleeping %v and will try again", lockID, sleep)
 				time.Sleep(sleep)
 				continue
@@ -235,9 +261,11 @@ func (s *Server) retryingCreateIndex(ctx context.Context, eb *model.ExportBatch,
 }
 
 func (s *Server) createIndex(ctx context.Context, eb *model.ExportBatch, newObjectNames []string) (string, int, error) {
-	objects, err := s.db.LookupExportFiles(ctx, eb.ConfigID)
+	db := s.env.Database()
+
+	objects, err := exportdatabase.New(db).LookupExportFiles(ctx, s.config.TTL)
 	if err != nil {
-		return "", 0, fmt.Errorf("lookup existing export files for batch %d: %w", eb.BatchID, err)
+		return "", 0, fmt.Errorf("lookup available export files: %w", err)
 	}
 
 	// Add the new objects (they haven't been committed to the database yet).
@@ -259,21 +287,21 @@ func (s *Server) createIndex(ctx context.Context, eb *model.ExportBatch, newObje
 	indexObjectName := exportIndexFilename(eb)
 	ctx, cancel := context.WithTimeout(ctx, blobOperationTimeout)
 	defer cancel()
-	if err := s.env.Blobstore().CreateObject(ctx, eb.BucketName, indexObjectName, data); err != nil {
+	if err := s.env.Blobstore().CreateObject(ctx, eb.BucketName, indexObjectName, data, false); err != nil {
 		return "", 0, fmt.Errorf("creating file %s in bucket %s: %w", indexObjectName, eb.BucketName, err)
 	}
 	return indexObjectName, len(objects), nil
 }
 
 func exportFilename(eb *model.ExportBatch, batchNum int) string {
-	return fmt.Sprintf("%s/%d-%05d%s", eb.FilenameRoot, eb.StartTimestamp.Unix(), batchNum, filenameSuffix)
+	return fmt.Sprintf("%s/%d-%d-%05d%s", eb.FilenameRoot, eb.StartTimestamp.Unix(), eb.EndTimestamp.Unix(), batchNum, filenameSuffix)
 }
 
 func exportIndexFilename(eb *model.ExportBatch) string {
 	return fmt.Sprintf("%s/index.txt", eb.FilenameRoot)
 }
 
-// randomInt is inclusive, [min:max]
+// randomInt is inclusive, [min:max].
 func randomInt(min, max int) (int, error) {
 	n, err := rand.Int(rand.Reader, big.NewInt(int64(max-min+1)))
 	if err != nil {
@@ -282,7 +310,7 @@ func randomInt(min, max int) (int, error) {
 	return int(n.Int64()) + min, nil
 }
 
-func ensureMinNumExposures(exposures []*model.Exposure, region string, minLength, jitter int) ([]*model.Exposure, error) {
+func ensureMinNumExposures(exposures []*publishmodel.Exposure, region string, minLength, jitter int) ([]*publishmodel.Exposure, error) {
 	if len(exposures) == 0 {
 		return exposures, nil
 	}
@@ -294,14 +322,14 @@ func ensureMinNumExposures(exposures []*model.Exposure, region string, minLength
 		// Pieces needed are
 		// (1) exposure key, (2) interval number, (3) transmission risk
 		// Exposure key is 16 random bytes.
-		eKey := make([]byte, model.KeyLength)
+		eKey := make([]byte, verifyapi.KeyLength)
 		_, err := rand.Read(eKey)
 		if err != nil {
 			return nil, fmt.Errorf("rand.Read: %w", err)
 		}
 
 		// Transmission risk is within the bounds.
-		transmissionRisk, err := randomInt(model.MinTransmissionRisk, model.MaxTransmissionRisk)
+		transmissionRisk, err := util.RandomTransmissionRisk()
 		if err != nil {
 			return nil, fmt.Errorf("randomInt: %w", err)
 		}
@@ -320,13 +348,14 @@ func ensureMinNumExposures(exposures []*model.Exposure, region string, minLength
 		}
 		intervalCount := exposures[fromIdx].IntervalCount
 
-		ek := &model.Exposure{
+		ek := &publishmodel.Exposure{
 			ExposureKey:      eKey,
 			TransmissionRisk: transmissionRisk,
 			Regions:          []string{region},
 			IntervalNumber:   intervalNumber,
 			IntervalCount:    intervalCount,
-			// The rest of the model.Exposure fields are not used in the export file.
+			// The rest of the publishmodel.Exposure fields are not used in the export
+			// file.
 		}
 		exposures = append(exposures, ek)
 	}

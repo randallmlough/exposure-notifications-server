@@ -111,8 +111,7 @@ func TestMakeBatchRanges(t *testing.T) {
 			got := makeBatchRanges(tc.period, latestEndT, nowT, time.Hour)
 
 			if len(got) != len(tc.want) {
-				t.Errorf("incorrect number of batches got %v, want %v", toSimpleBatchRange(t, got), tc.want)
-				return
+				t.Fatalf("incorrect number of batches got %v, want %v", toSimpleBatchRange(t, got), tc.want)
 			}
 
 			for i := range got {
@@ -129,7 +128,6 @@ func TestMakeBatchRanges(t *testing.T) {
 					t.Errorf("unexpected range difference between start and end for index %d, got %v, want %v", i, got[i].end.Sub(got[i].start), tc.period)
 				}
 			}
-
 		})
 	}
 }

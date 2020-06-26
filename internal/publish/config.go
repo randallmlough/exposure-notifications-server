@@ -18,36 +18,50 @@ package publish
 import (
 	"time"
 
+	"github.com/google/exposure-notifications-server/internal/authorizedapp"
 	"github.com/google/exposure-notifications-server/internal/database"
-	"github.com/google/exposure-notifications-server/internal/dbapiconfig"
+	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/setup"
+	"github.com/google/exposure-notifications-server/internal/verification"
+	"github.com/google/exposure-notifications-server/pkg/secrets"
 )
 
 // Compile-time check to assert this config matches requirements.
-var _ setup.DBAPIConfigProvider = (*Config)(nil)
-var _ setup.DBConfigProvider = (*Config)(nil)
+var _ setup.AuthorizedAppConfigProvider = (*Config)(nil)
+var _ setup.DatabaseConfigProvider = (*Config)(nil)
+var _ setup.SecretManagerConfigProvider = (*Config)(nil)
+var _ setup.ObservabilityExporterConfigProvider = (*Config)(nil)
 
 // Config represents the configuration and associated environment variables for
 // the publish components.
 type Config struct {
-	Port                     string        `envconfig:"PORT" default:"8080"`
-	MinRequestDuration       time.Duration `envconfig:"TARGET_REQUEST_DURATION" default:"5s"`
-	MaxKeysOnPublish         int           `envconfig:"MAX_KEYS_ON_PUBLISH" default:"14"`
-	MaxIntervalAge           time.Duration `envconfig:"MAX_INTERVAL_AGE_ON_PUBLISH" default:"360h"`
-	APIConfigRefreshDuration time.Duration `envconfig:"CONFIG_REFRESH_DURATION" default:"5m"`
-	TruncateWindow           time.Duration `envconfig:"TRUNCATE_WINDOW" default:"1h"`
+	AuthorizedApp         authorizedapp.Config
+	Database              database.Config
+	SecretManager         secrets.Config
+	Verification          verification.Config
+	ObservabilityExporter observability.Config
 
-	APIConfigOpts *dbapiconfig.ConfigOpts
+	Port             string        `env:"PORT, default=8080"`
+	MaxKeysOnPublish int           `env:"MAX_KEYS_ON_PUBLISH, default=15"`
+	MaxIntervalAge   time.Duration `env:"MAX_INTERVAL_AGE_ON_PUBLISH, default=360h"`
+	TruncateWindow   time.Duration `env:"TRUNCATE_WINDOW, default=1h"`
 
-	Database *database.Config
+	// Flags for local development and testing.
+	DebugReleaseSameDayKeys bool `env:"DEBUG_RELEASE_SAME_DAY_KEYS"`
 }
 
-// API returns the configuration for the DB APIConfig provider.
-func (c *Config) API() *dbapiconfig.ConfigOpts {
-	return c.APIConfigOpts
+func (c *Config) AuthorizedAppConfig() *authorizedapp.Config {
+	return &c.AuthorizedApp
 }
 
-// DB returns the configuration for the databse.
-func (c *Config) DB() *database.Config {
-	return c.Database
+func (c *Config) DatabaseConfig() *database.Config {
+	return &c.Database
+}
+
+func (c *Config) SecretManagerConfig() *secrets.Config {
+	return &c.SecretManager
+}
+
+func (c *Config) ObservabilityExporterConfig() *observability.Config {
+	return &c.ObservabilityExporter
 }

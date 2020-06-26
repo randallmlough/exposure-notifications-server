@@ -27,17 +27,24 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/database"
+	coredb "github.com/google/exposure-notifications-server/internal/database"
+	"github.com/google/exposure-notifications-server/internal/federationin/database"
+	"github.com/google/exposure-notifications-server/internal/federationin/model"
 	"github.com/google/exposure-notifications-server/internal/logging"
 	"github.com/google/exposure-notifications-server/internal/metrics"
-	"github.com/google/exposure-notifications-server/internal/model"
 	"github.com/google/exposure-notifications-server/internal/pb"
+	publishdb "github.com/google/exposure-notifications-server/internal/publish/database"
+	publishmodel "github.com/google/exposure-notifications-server/internal/publish/model"
 	"github.com/google/exposure-notifications-server/internal/serverenv"
+	verifyapi "github.com/google/exposure-notifications-server/pkg/api/v1alpha1"
 
 	"google.golang.org/api/idtoken"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/oauth"
+
+	"go.opencensus.io/plugin/ocgrpc"
+	"go.opencensus.io/trace"
 )
 
 const (
@@ -45,12 +52,14 @@ const (
 )
 
 var (
-	fetchBatchSize = database.InsertExposuresBatchSize
+	fetchBatchSize = publishdb.InsertExposuresBatchSize
 )
 
-type fetchFn func(context.Context, *pb.FederationFetchRequest, ...grpc.CallOption) (*pb.FederationFetchResponse, error)
-type insertExposuresFn func(context.Context, []*model.Exposure) error
-type startFederationSyncFn func(context.Context, *model.FederationInQuery, time.Time) (int64, database.FinalizeSyncFn, error)
+type (
+	fetchFn               func(context.Context, *pb.FederationFetchRequest, ...grpc.CallOption) (*pb.FederationFetchResponse, error)
+	insertExposuresFn     func(context.Context, []*publishmodel.Exposure) error
+	startFederationSyncFn func(context.Context, *model.FederationInQuery, time.Time) (int64, database.FinalizeSyncFn, error)
+)
 
 type pullDependencies struct {
 	fetch               fetchFn
@@ -62,20 +71,24 @@ type pullDependencies struct {
 // federation results for a single federation query.
 func NewHandler(env *serverenv.ServerEnv, config *Config) http.Handler {
 	return &handler{
-		env:    env,
-		db:     env.Database(),
-		config: config,
+		env:       env,
+		db:        database.New(env.Database()),
+		publishdb: publishdb.New(env.Database()),
+		config:    config,
 	}
 }
 
 type handler struct {
-	env    *serverenv.ServerEnv
-	db     *database.DB
-	config *Config
+	env       *serverenv.ServerEnv
+	db        *database.FederationInDB
+	publishdb *publishdb.PublishDB
+	config    *Config
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
+	ctx, span := trace.StartSpan(r.Context(), "(*federationin.handler).ServeHTTP")
+	defer span.End()
+
 	logger := logging.FromContext(ctx)
 	metrics := h.env.MetricsExporter(ctx)
 
@@ -101,21 +114,25 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	lock := "query_" + queryID
 	unlockFn, err := h.db.Lock(ctx, lock, h.config.Timeout)
 	if err != nil {
-		if errors.Is(err, database.ErrAlreadyLocked) {
+		if errors.Is(err, coredb.ErrAlreadyLocked) {
 			metrics.WriteInt("federation-pull-lock-contention", true, 1)
 			msg := fmt.Sprintf("Lock %s already in use. No work will be performed.", lock)
 			logger.Infof(msg)
-			w.Write([]byte(msg)) // We return status 200 here so that Cloud Scheduler does not retry.
+			fmt.Fprint(w, msg) // We return status 200 here so that Cloud Scheduler does not retry.
 			return
 		}
 		internalErrorf(ctx, w, "Could not acquire lock %s for query %s: %v", lock, queryID, err)
 		return
 	}
-	defer unlockFn()
+	defer func() {
+		if err := unlockFn(); err != nil {
+			logger.Errorf("failed to unlock: %v", err)
+		}
+	}()
 
 	query, err := h.db.GetFederationInQuery(ctx, queryID)
 	if err != nil {
-		if errors.Is(err, database.ErrNotFound) {
+		if errors.Is(err, coredb.ErrNotFound) {
 			badRequestf(ctx, w, "unknown %s", queryParam)
 			return
 		}
@@ -142,7 +159,10 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tlsConfig := &tls.Config{RootCAs: cp, InsecureSkipVerify: h.config.TLSSkipVerify}
-	dialOpts := []grpc.DialOption{grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig))}
+	dialOpts := []grpc.DialOption{
+		grpc.WithStatsHandler(&ocgrpc.ClientHandler{}),
+		grpc.WithTransportCredentials(credentials.NewTLS(tlsConfig)),
+	}
 
 	var clientOpts []idtoken.ClientOption
 	if h.config.CredentialsFile != "" {
@@ -153,7 +173,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		internalErrorf(ctx, w, "Failed to create token source: %v", err)
 		return
 	}
-	dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(oauth.TokenSource{ts}))
+	dialOpts = append(dialOpts, grpc.WithPerRPCCredentials(oauth.TokenSource{
+		TokenSource: ts,
+	}))
 
 	logger.Infof("Dialing %s", query.ServerAddr)
 	conn, err := grpc.Dial(query.ServerAddr, dialOpts...)
@@ -167,35 +189,54 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	timeoutContext, cancel := context.WithTimeout(ctx, h.config.Timeout)
 	defer cancel()
 
-	deps := pullDependencies{
-		fetch:               client.Fetch,
-		insertExposures:     h.db.InsertExposures,
-		startFederationSync: h.db.StartFederationInSync,
+	opts := pullOptions{
+		deps: pullDependencies{
+			fetch:               client.Fetch,
+			insertExposures:     h.publishdb.InsertExposures,
+			startFederationSync: h.db.StartFederationInSync,
+		},
+		query:          query,
+		batchStart:     time.Now(),
+		truncateWindow: h.config.TruncateWindow,
 	}
-	batchStart := time.Now()
-	if err := pull(timeoutContext, metrics, deps, query, batchStart, h.config.TruncateWindow); err != nil {
+	if err := pull(timeoutContext, metrics, &opts); err != nil {
 		internalErrorf(ctx, w, "Federation query %q failed: %v", queryID, err)
 		return
 	}
 
-	if timeoutContext.Err() != nil && timeoutContext.Err() == context.DeadlineExceeded {
+	if errors.Is(timeoutContext.Err(), context.DeadlineExceeded) {
 		logger.Infof("Federation puller timed out at %v before fetching entire set.", h.config.Timeout)
 	}
 }
 
-func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, q *model.FederationInQuery, batchStart time.Time, truncateWindow time.Duration) error {
+type pullOptions struct {
+	deps           pullDependencies
+	query          *model.FederationInQuery
+	batchStart     time.Time
+	truncateWindow time.Duration
+}
+
+func pull(ctx context.Context, metrics metrics.Exporter, opts *pullOptions) (err error) {
+	ctx, span := trace.StartSpan(ctx, "federationin.pull")
+	defer func() {
+		if err != nil {
+			span.SetStatus(trace.Status{Code: trace.StatusCodeInternal, Message: err.Error()})
+		}
+		span.End()
+	}()
+
 	logger := logging.FromContext(ctx)
-	logger.Infof("Processing query %q", q.QueryID)
+	logger.Infof("Processing query %q", opts.query.QueryID)
 
 	request := &pb.FederationFetchRequest{
-		RegionIdentifiers:             q.IncludeRegions,
-		ExcludeRegionIdentifiers:      q.ExcludeRegions,
-		LastFetchResponseKeyTimestamp: q.LastTimestamp.Unix(),
+		RegionIdentifiers:             opts.query.IncludeRegions,
+		ExcludeRegionIdentifiers:      opts.query.ExcludeRegions,
+		LastFetchResponseKeyTimestamp: opts.query.LastTimestamp.Unix(),
 	}
 
-	syncID, finalizeFn, err := deps.startFederationSync(ctx, q, batchStart)
+	syncID, finalizeFn, err := opts.deps.startFederationSync(ctx, opts.query, opts.batchStart)
 	if err != nil {
-		return fmt.Errorf("starting federation sync for query %s: %w", q.QueryID, err)
+		return fmt.Errorf("starting federation sync for query %s: %w", opts.query.QueryID, err)
 	}
 
 	var maxTimestamp time.Time
@@ -204,15 +245,18 @@ func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, 
 		logger.Infof("Inserted %d keys", total)
 	}()
 
-	createdAt := model.TruncateWindow(batchStart, truncateWindow)
+	createdAt := publishmodel.TruncateWindow(opts.batchStart, opts.truncateWindow)
 	partial := true
+	nPartials := int64(0)
 	for partial {
+		nPartials++
+		span.AddAttributes(trace.Int64Attribute("n_partial", nPartials))
 
 		// TODO(squee1945): react to the context timeout and complete a chunk of work so next invocation can pick up where left off.
 
-		response, err := deps.fetch(ctx, request)
+		response, err := opts.deps.fetch(ctx, request)
 		if err != nil {
-			return fmt.Errorf("fetching query %s: %w", q.QueryID, err)
+			return fmt.Errorf("fetching query %s: %w", opts.query.QueryID, err)
 		}
 
 		responseTimestamp := time.Unix(response.FetchResponseKeyTimestamp, 0)
@@ -220,10 +264,9 @@ func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, 
 			maxTimestamp = responseTimestamp
 		}
 
-		// Loop through the result set, storing in database.
-		var exposures []*model.Exposure
+		// Loop through the result set, storing in publishdb.
+		var exposures []*publishmodel.Exposure
 		for _, ctr := range response.Response {
-
 			var upperRegions []string
 			for _, region := range ctr.RegionIdentifiers {
 				upperRegions = append(upperRegions, strings.ToUpper(strings.TrimSpace(region)))
@@ -231,25 +274,25 @@ func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, 
 			sort.Strings(upperRegions)
 
 			for _, cti := range ctr.ContactTracingInfo {
-
-				verificationAuthName := strings.ToUpper(strings.TrimSpace(cti.VerificationAuthorityName))
-
 				for _, key := range cti.ExposureKeys {
+					if cti.TransmissionRisk < verifyapi.MinTransmissionRisk || cti.TransmissionRisk > verifyapi.MaxTransmissionRisk {
+						logger.Errorf("invalid transmission risk %v - dropping record.", cti.TransmissionRisk)
+						continue
+					}
 
-					exposures = append(exposures, &model.Exposure{
-						TransmissionRisk:          int(cti.TransmissionRisk),
-						ExposureKey:               key.ExposureKey,
-						Regions:                   upperRegions,
-						FederationSyncID:          syncID,
-						IntervalNumber:            key.IntervalNumber,
-						IntervalCount:             key.IntervalCount,
-						CreatedAt:                 createdAt,
-						LocalProvenance:           false,
-						VerificationAuthorityName: verificationAuthName,
+					exposures = append(exposures, &publishmodel.Exposure{
+						TransmissionRisk: int(cti.TransmissionRisk),
+						ExposureKey:      key.ExposureKey,
+						Regions:          upperRegions,
+						FederationSyncID: syncID,
+						IntervalNumber:   key.IntervalNumber,
+						IntervalCount:    key.IntervalCount,
+						CreatedAt:        createdAt,
+						LocalProvenance:  false,
 					})
 
 					if len(exposures) == fetchBatchSize {
-						if err := deps.insertExposures(ctx, exposures); err != nil {
+						if err := opts.deps.insertExposures(ctx, exposures); err != nil {
 							metrics.WriteInt("federation-pull-inserts", false, len(exposures))
 							return fmt.Errorf("inserting %d exposures: %w", len(exposures), err)
 						}
@@ -260,7 +303,7 @@ func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, 
 			}
 		}
 		if len(exposures) > 0 {
-			if err := deps.insertExposures(ctx, exposures); err != nil {
+			if err := opts.deps.insertExposures(ctx, exposures); err != nil {
 				metrics.WriteInt("federation-pull-inserts", false, len(exposures))
 				return fmt.Errorf("inserting %d exposures: %w", len(exposures), err)
 			}
@@ -273,7 +316,7 @@ func pull(ctx context.Context, metrics metrics.Exporter, deps pullDependencies, 
 
 	if err := finalizeFn(maxTimestamp, total); err != nil {
 		// TODO(squee1945): how do we clean up here? Just leave the records in and have the exporter eliminate them? Other?
-		return fmt.Errorf("finalizing federation sync for query %s: %w", q.QueryID, err)
+		return fmt.Errorf("finalizing federation sync for query %s: %w", opts.query.QueryID, err)
 	}
 
 	return nil

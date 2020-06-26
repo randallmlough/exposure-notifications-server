@@ -23,7 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/model"
+	verifyapi "github.com/google/exposure-notifications-server/pkg/api/v1alpha1"
 
 	"github.com/google/go-cmp/cmp"
 )
@@ -34,7 +34,7 @@ func TestInvalidHeader(t *testing.T) {
 	r.Header.Set("content-type", "application/text")
 
 	w := httptest.NewRecorder()
-	data := &model.Publish{}
+	data := &verifyapi.Publish{}
 	code, err := Unmarshal(w, r, data)
 
 	expCode := http.StatusUnsupportedMediaType
@@ -64,15 +64,13 @@ func TestMultipleJson(t *testing.T) {
 			 {"key": "DEF"},
 			 {"key": "123"}],
 		"appPackageName": "com.google.android.awesome",
-		"regions": ["us"],
-		"deviceVerificationPayload": "foo"}
+		"regions": ["us"]}
 		{"temporaryExposureKeys":
 			[{"key": "ABC"},
 			 {"key": "DEF"},
 			 {"key": "123"}],
 		"appPackageName": "com.google.android.awesome",
-		"regions": ["us"],
-		"deviceVerificationPayload": "foo"}`,
+		"regions": ["us"]}`,
 	}
 	errors := []string{
 		"body must contain only one JSON object",
@@ -119,9 +117,7 @@ func TestValidPublishMessage(t *testing.T) {
 		  {"key": "DEF", "rollingStartNumber": %v, "rollingPeriod": 122, "TransmissionRisk": 2},
 			{"key": "123", "rollingStartNumber": %v, "rollingPeriod": 1, "TransmissionRisk": 2}],
     "appPackageName": "com.google.android.awesome",
-    "platform": "android",
     "regions": ["CA", "US"],
-    "DeviceVerificationPayload": "foo",
     "VerificationPayload": "1234-ABCD-EFGH-5678"}`
 	json = fmt.Sprintf(json, intervalNumber, intervalNumber, intervalNumber)
 
@@ -131,7 +127,7 @@ func TestValidPublishMessage(t *testing.T) {
 
 	w := httptest.NewRecorder()
 
-	got := &model.Publish{}
+	got := &verifyapi.Publish{}
 	code, err := Unmarshal(w, r, got)
 	if err != nil {
 		t.Fatalf("unexpected err, %v", err)
@@ -140,17 +136,15 @@ func TestValidPublishMessage(t *testing.T) {
 		t.Errorf("unmarshal wanted %v response code, got %v", http.StatusOK, code)
 	}
 
-	want := &model.Publish{
-		Keys: []model.ExposureKey{
+	want := &verifyapi.Publish{
+		Keys: []verifyapi.ExposureKey{
 			{Key: "ABC", IntervalNumber: intervalNumber, IntervalCount: 144, TransmissionRisk: 2},
 			{Key: "DEF", IntervalNumber: intervalNumber, IntervalCount: 122, TransmissionRisk: 2},
 			{Key: "123", IntervalNumber: intervalNumber, IntervalCount: 1, TransmissionRisk: 2},
 		},
-		Regions:                   []string{"CA", "US"},
-		Platform:                  "android",
-		AppPackageName:            "com.google.android.awesome",
-		DeviceVerificationPayload: "foo",
-		VerificationPayload:       "1234-ABCD-EFGH-5678",
+		Regions:             []string{"CA", "US"},
+		AppPackageName:      "com.google.android.awesome",
+		VerificationPayload: "1234-ABCD-EFGH-5678",
 	}
 	if diff := cmp.Diff(want, got); diff != "" {
 		t.Errorf("unmarshal mismatch (-want +got):\n%v", diff)
@@ -158,13 +152,14 @@ func TestValidPublishMessage(t *testing.T) {
 }
 
 func unmarshalTestHelper(t *testing.T, payloads []string, errors []string, expCode int) {
+	t.Helper()
 	for i, testStr := range payloads {
 		body := ioutil.NopCloser(bytes.NewReader([]byte(testStr)))
 		r := httptest.NewRequest("POST", "/", body)
-		r.Header.Set("content-type", "application/json")
+		r.Header.Set("content-type", "application/json; charset=utf-8")
 
 		w := httptest.NewRecorder()
-		data := &model.Publish{}
+		data := &verifyapi.Publish{}
 		code, err := Unmarshal(w, r, data)
 		if code != expCode {
 			t.Errorf("unmarshal wanted %v response code, got %v", expCode, code)

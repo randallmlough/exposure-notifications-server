@@ -22,19 +22,22 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/database"
-	"github.com/google/exposure-notifications-server/internal/model"
-	"github.com/kelseyhightower/envconfig"
+	coredb "github.com/google/exposure-notifications-server/internal/database"
+	"github.com/google/exposure-notifications-server/internal/export/database"
+	"github.com/google/exposure-notifications-server/internal/export/model"
+	"github.com/google/exposure-notifications-server/internal/setup"
 )
 
 var (
-	bucketName    = flag.String("bucket-name", "", "The bucket name to store the export file.")
-	filenameRoot  = flag.String("filename-root", "", "The root filename for the export file.")
-	period        = flag.Duration("period", 24*time.Hour, "The frequency with which to create export files.")
-	region        = flag.String("region", "", "The region for the export batches/files.")
-	fromTimestamp = flag.String("from-timestamp", "", "The timestamp (RFC3339) when this config becomes active.")
-	thruTimestamp = flag.String("thru-timestamp", "", "The timestamp (RFC3339) when this config ends.")
-	signingKey    = flag.String("signing-key", "", "The KMS resource ID to use for signing batches.")
+	bucketName        = flag.String("bucket-name", "", "The bucket name to store the export file.")
+	filenameRoot      = flag.String("filename-root", "", "The root filename for the export file.")
+	period            = flag.Duration("period", 24*time.Hour, "The frequency with which to create export files.")
+	region            = flag.String("region", "", "The output region for the export batches/files.")
+	fromTimestamp     = flag.String("from-timestamp", "", "The timestamp (RFC3339) when this config becomes active.")
+	thruTimestamp     = flag.String("thru-timestamp", "", "The timestamp (RFC3339) when this config ends.")
+	signingKey        = flag.String("signing-key", "", "The KMS resource ID to use for signing batches.")
+	signingKeyID      = flag.String("signing-key-id", "", "The ID of the signing key (for clients).")
+	signingKeyVersion = flag.String("signing-key-version", "", "The version of the signing key (for clients).")
 )
 
 func main() {
@@ -74,28 +77,33 @@ func main() {
 	}
 
 	ctx := context.Background()
-	var config database.Config
-	err := envconfig.Process("database", &config)
+	var config coredb.Config
+	env, err := setup.Setup(ctx, &config)
 	if err != nil {
-		log.Fatalf("error loading environment variables: %v", err)
+		log.Fatalf("failed to setup: %v", err)
 	}
+	defer env.Close(ctx)
 
-	db, err := database.NewFromEnv(ctx, &config)
-	if err != nil {
-		log.Fatalf("unable to connect to database: %v", err)
+	db := database.New(env.Database())
+
+	si := model.SignatureInfo{
+		SigningKey:        *signingKey,
+		SigningKeyVersion: *signingKeyVersion,
+		SigningKeyID:      *signingKeyID,
 	}
-	defer db.Close(ctx)
+	if err := db.AddSignatureInfo(ctx, &si); err != nil {
+		log.Fatalf("AddSignatureInfo: %v", err)
+	}
 
 	ec := model.ExportConfig{
-		BucketName:   *bucketName,
-		FilenameRoot: *filenameRoot,
-		Period:       *period,
-		Region:       *region,
-		From:         fromTime,
-		Thru:         thruTime,
-		SigningKey:   *signingKey,
+		BucketName:       *bucketName,
+		FilenameRoot:     *filenameRoot,
+		Period:           *period,
+		OutputRegion:     *region,
+		From:             fromTime,
+		Thru:             thruTime,
+		SignatureInfoIDs: []int64{si.ID},
 	}
-
 	if err := db.AddExportConfig(ctx, &ec); err != nil {
 		log.Fatalf("Failure: %v", err)
 	}

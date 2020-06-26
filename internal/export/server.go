@@ -15,9 +15,10 @@
 package export
 
 import (
+	"context"
 	"fmt"
+	"net/http"
 
-	"github.com/google/exposure-notifications-server/internal/database"
 	"github.com/google/exposure-notifications-server/internal/serverenv"
 )
 
@@ -27,12 +28,17 @@ func NewServer(config *Config, env *serverenv.ServerEnv) (*Server, error) {
 	if env.Blobstore() == nil {
 		return nil, fmt.Errorf("export.NewBatchServer requires Blobstore present in the ServerEnv")
 	}
+	if env.Database() == nil {
+		return nil, fmt.Errorf("export.NewBatchServer requires Database present in the ServerEnv")
+	}
 	if env.KeyManager() == nil {
 		return nil, fmt.Errorf("export.NewBatchServer requires KeyManager present in the ServerEnv")
 	}
+	if config.MinWindowAge < 0 {
+		return nil, fmt.Errorf("MIN_WINDOW_AGE must be a duration of >= 0")
+	}
 
 	return &Server{
-		db:     env.Database(),
 		config: config,
 		env:    env,
 	}, nil
@@ -40,7 +46,16 @@ func NewServer(config *Config, env *serverenv.ServerEnv) (*Server, error) {
 
 // Server hosts end points to manage export batches.
 type Server struct {
-	db     *database.DB
 	config *Config
 	env    *serverenv.ServerEnv
+}
+
+// Routes defines and returns the routes for this server.
+func (s *Server) Routes(ctx context.Context) *http.ServeMux {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/create-batches", s.handleCreateBatches(ctx))
+	mux.HandleFunc("/do-work", s.handleDoWork(ctx))
+
+	return mux
 }

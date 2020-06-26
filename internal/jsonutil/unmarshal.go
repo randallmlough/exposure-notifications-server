@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package jsonutil provides common utilities for properly handling JSON payloads in HTPT body.
+// Package jsonutil provides common utilities for properly handling JSON payloads in HTTP body.
 package jsonutil
 
 import (
@@ -31,9 +31,9 @@ const (
 	maxBodyBytes = 64_000
 )
 
-// Unmarshal provides a common implementation of JSON unmarshalling with well defined error handling.
+// Unmarshal provides a common implementation of JSON unmarshaling with well defined error handling.
 func Unmarshal(w http.ResponseWriter, r *http.Request, data interface{}) (int, error) {
-	if t := r.Header.Get("Content-type"); t != "application/json" {
+	if t := r.Header.Get("content-type"); len(t) < 16 || t[:16] != "application/json" {
 		return http.StatusUnsupportedMediaType, fmt.Errorf("content-type is not application/json")
 	}
 

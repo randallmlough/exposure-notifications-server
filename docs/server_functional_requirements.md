@@ -1,22 +1,26 @@
-# Google Exposure Notification Server
+---
+layout: default
+classes: wide
+---
+# Google Exposure Notification Key Server
 
 ## Functional requirements
 
 This documents the functional requirements for building a decentralized exposure
-notification system. For deployment stratgies, see [Server Deployment Options](server_deployment_options.md).
+notification system. For deployment strategies, see [Server Deployment Options](server_deployment_options.md).
 
 ### System Components
 
-The Exposure Notification Server's archicture has been split into components.
+The Exposure Notification Key Server's architecture has been split into components.
 The following diagram shows the relationship between the different components:
 
-![A diagram showing the Exposure Notification Server components and their relationship](images/functional_diagram.svg "Server Requirements Diagram")
+![A diagram showing the Exposure Notification Key Server components and their relationship](images/functional_diagram.svg "Server Requirements Diagram")
 
 The server components are responsible for the following functions:
 
 * Accepting the temporary exposure keys of positively diagnosed users from
-mobile devices, validating those keys via device attestation APIs, and
-storing those keys in a database.
+mobile devices, validating those keys via configured public health authority
+_diagnosis verification servers_.
 
 * Periodically generating incremental files for download by client
 devices for performing the key matching algorithm that is run on the mobile
@@ -34,20 +38,31 @@ device download content.
 
 * Recommended: Periodically deleting old temporary exposure keys. After 14
 days (or configured time period) the keys can no longer be matched to devices.
+_Please seek legal counsel about data retention policies in your locale._
 
 * Recommended: Using a CDN to distribute the temporary exposure keys of affected
 users to mobile devices.
 
 ### Publishing temporary exposure keys
 
+Before reporting temporary exposure keys to the exposure notifications key server,
+a diagnosis must first verified by a _diagnosis verification server_. The
+diagnosis verification server is intentionally separate from the exposure
+notifications server. The verification server is run by a local government or
+public health authority. The exposure notification key server is responsible for
+[validating these certificates](design/verification_protocol.md).
+
 When a user reports a diagnosis, it is reported using the publish API server.
 In the reference server implementation, the data is encoded in JSON and sent
-over HTTPS, however you can use any encoding and protocol.
+over HTTPS, however you can use any encoding and protocol. None of the data
+stored in the database is personally identifiable information (PII).
 
 A given mobile application and server pair could agree upon additional
 information to be shared. The information described in this section is the
 minimum required set in order to validate the uploads and to generate the
 necessary client batches for ingestion into the device for key matching.
+
+We have provides a sample API in [exposure_types.go](https://github.com/google/exposure-notifications-server/blob/master/pkg/api/v1alpha1/exposure_types.go).
 
 Minimum required fields, followed by a JSON example:
 
@@ -80,23 +95,21 @@ Minimum required fields, followed by a JSON example:
   * Type: Array of string
   * Description: 2 letter country to identify the region(s) a key is valid for.
 * `appPackageName` (**REQUIRED**)
-  * Type: string
-  * Constraints:
-    * For Android device, this must match the device `appPackageName` in the
-      SafetyNet verification payload
-  * Description: name of the application bundle that sent the request.
-* `platform` (**REQUIRED**)
-  * Type: string
-  * Description: Mobile device platform this request originated from.
-* `deviceVerificationPayload` (**REQUIRED**)
+  * Type: string (lowercase)
+  * Description: Name of the application being used to send the request. This
+    is used to determine what app is uploading keys and if it is an allowed
+    region for that app. (BundleID on iOS)
+* `verificationPayload` (**REQUIRED FOR VERIFICATION PROTOCOL**)
   * Type: String
-  * Description:  Verification payload.
-    * For Android devices this is a SafetyNet device attestation in JSON Web
-    Signature (JWS) format.
-    * For iOS devices, this is a DeviceCheck attestation.
-* `verificationPayload`
+  * Description: verificationPayload is a signed certificate from a public
+    health authority, indicating a confirmed diagnosis
+* `hmackey` (**REQUIRED FOR VERIFICATION PROTOCOL**)
   * Type: String
-  * Description: some signature / code confirming authorization by the verification authority.
+  * Description: The device generated, random key that was used to create the
+  HMAC for the data sent to the diagnosis verification server. The actual
+  data to calculate the HMAC over is defined as part of the
+  [verification protocol](design/verification_protocol.md). This field is base64
+  encoded.
 * `padding`
   * Type: String
   * Constraints:
@@ -108,51 +121,24 @@ The following snippet is an example POST request payload in JSON format.
 
 ```json
 {
-  "temporaryTracingKeys": [
+  "temporaryExposureKeys": [
     {"key": "base64 KEY1", "rollingStartNumber": 12345, "rollingPeriod": 144, "transmissionRisk": 5},
     {"key": "base64 KEY2", "rollingStartNumber": 12489, "rollingPeriod": 10, "transmissionRisk": 6},
     {"key": "base64 KEYN", "rollingStartNumber": 12499, "rollingPeriod": 100, "transmissionRisk": 7}],
   "regions": ["US", "CA", "MX"],
   "appPackageName": "com.foo.app",
-  "platform": "android",
-  "deviceVerificationPayload": "base64 encoded attestation payload string",
-  "verificationPayload": "signature /code from  of verifying authority",
+  "verificationPayload": "signed JWT issued by public health authority",
+  "hmackey": "base64 encoded HMAC key used in preparing the data for the verification server",
   "padding": "random string data..."
 }
 ```
 
 ### Requirements and recommendations
 
-* Required: A whitelist check for `appPackageName` and the regions in
-which the app is allowed to report on.
-
-* Required: Android device verification. The SafetyNet device attestation API
-can be used to confirm a genuine Android device. For more information on
-SafetyNet, see the
-[SafetyNet Attestation API](https://developer.android.com/training/safetynet/attestation).
-
-  * Having `temporaryTracingKeys` and `regions` be part of the device
-  attestation will allow only data used to verify the device to be uploaded.
-
-  * For verification instructions, see [Verify the SafetyNet attestation response.](https://developer.android.com/training/safetynet/attestation#verify-attestation-response)
-
-* Required: iOS device verification. You can use the `DeviceCheck` API can be
-used to confirm a genuine iOS device. For more
-information, see the
-[DeviceCheck overview](https://developer.apple.com/documentation/devicecheck).
-
-  * For verification instructions, see
-  [Communicate with APNs using authentication tokens](https://help.apple.com/developer-account/#/deva05921840)
-
-* Recommended: The `transaction_id` in the payload should be the SHA256 hash of
-the concatenation of:
-
-  * `appPackageName`
-
-  * Concatenation of the `TrackingKey.Key` values in their base64 encoding,
-  sorted lexicographically
-
-  * Concatenation of regions, uppercased, sorted lexicographically
+* Required: An allow-list check for `appPackageName` and the regions in
+which the app is allowed to report on. Individual applications should also be
+configured for one or more public health authorities they at they accept
+diagnosis verifications from.
 
 * Recommended: To discourage abuse, only failures in processing should
 return retry-able error codes to clients. For example, invalid device
@@ -161,16 +147,23 @@ analysis.
 
 * Appropriate denial of service protection should be put in place.
 
+* Recommended: Our overall security and privacy recommendation is to, from
+  the mobile application, periodically send chaff requests to the sever so that
+  ALL users appear to be reporting themselves as infected multiple times per
+  day. These requests will be rejected if they contain an invalid or unsigned
+  JWT in the `verificationPayload` field.
+
 ### Batch creation and publishing
 
 You should schedule a script that generates files for download over the HTTPS
 protocol to client devices. The generation of these files are a regular and
-frequent operation (at least once a day per device), we recommend that you
+frequent operation (batches should be generated at least once a day), we recommend that you
 generate the files in a single operation rather than on-demand, and distribute
 the files using a CDN.
 
 For information on the format of the batch file, see
-[Exposure Key Export File Format and Verification](https://www.google.com/covid19/exposurenotifications/pdfs/Exposure-Key-File-Format-and-Verification.pdf).
+[Exposure Key Export File Format and Verification](https://developers.google.com/android/exposure-notifications/exposure-key-file-format)
+and [Working with Export Files](https://github.com/google/exposure-notifications-server/tree/master/examples/export).
 
 The batch file generation should be per-region, incremental feeds of new data.
 While additional data can be included in the downloads, there is a minimum set
@@ -206,10 +199,6 @@ The use of a secure secret manager (for example,
 [Key Vault](https://azure.microsoft.com/en-us/services/key-vault/),
 [Cloud Secret](https://cloud.google.com/secret-manager)) or a hardened
 on-premises equivalent is required to store the following data:
-
-* API keys
-  * Android SafetyNet API key
-  * API keys and credentials needed for publication to the CDN
 
 * Private signing key
   * The private key for signing the client download files

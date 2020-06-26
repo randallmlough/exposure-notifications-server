@@ -1,13 +1,22 @@
-# Exposure Notification Reference Server
+# Exposure Notification Reference Key Server
 
-[https://www.google.com/covid19/exposurenotifications/](https://www.google.com/covid19/exposurenotifications/)
+[COVID‑19 Exposure Notifications API](https://www.google.com/covid19/exposurenotifications/)
 
-In our continued effort to help governments and health authorities during the COVID-19 pandemic, we have authored an open source reference implementation of an Exposure Notifications server. The server reference design implements the Exposure Notifications API and provides reference code for working with both Android and iOS apps that are built by public health authorities. The reference server source code is available on GitHub and can be deployed on any modern infrastructure or cloud provider selected by a public health authority. 
+[Exposure Notification Reference Key Server Documentation](https://google.github.io/exposure-notifications-server/) 
 
-The reference server implementation accepts, validates, and stores temporary exposure keys from verified mobile devices. It also periodically generates and signs incremental files that will later be downloaded by clients to perform the on-device key matching algorithm. Our hope is by making this privacy-preserving server implementation available to health authorities we can enable their developers to use the open source code to get started quickly. 
+In our continued effort to help governments and health authorities during the
+COVID-19 pandemic, we have authored an open source reference implementation of
+an Exposure Notification Key Server.
 
-This repository contains a reference implementation of an exposure notification
-server for use in a mobile exposure notification system.
+The server reference in this repository implements the Exposure Notifications
+API and provides reference code for working with Android and iOS apps that
+are built by public health authorities. The reference server source code is
+available on GitHub and can be deployed on any infrastructure or cloud
+provider selected by a public health authority.
+
+Our hope is by making this privacy-preserving server implementation available
+to health authorities, we can enable their developers to use the open source code
+to get started quickly.
 
 ## Overview
 
@@ -31,15 +40,16 @@ The server is responsible for the following functions:
 ## Tutorials and reference documentation
 
 You can read tutorials on deploying and using the reference Exposure Notification
-Server here:
+Key Server here:
 
-* [Overview](docs/index.md)
-* [Deployment Guide](docs/deploying.md)
+* [Overview](https://google.github.io/exposure-notifications-server/)
+* [Deployment Guide](https://google.github.io/exposure-notifications-server/getting-started/deploying)
 * [Reference Documentation](https://pkg.go.dev/mod/github.com/google/exposure-notifications-server)
-* [Server Functional Requirements](docs/server_functional_requirements.md)
-* [Server Deployment Options](docs/server_deployment_options.md)
+* [Server Functional Requirements](https://google.github.io/exposure-notifications-server/server_functional_requirements)
+* [Server Deployment Options](https://google.github.io/exposure-notifications-server/server_deployment_options)
+* [API Definitions](pkg/api/v1alpha1)
 
-# Issues and Questions
+## Issues and Questions
 
 You can open a
 [GitHub Issue](https://github.com/google/exposure-notifications-server/issues/new).
@@ -51,4 +61,3 @@ exposure-notifications-feedback@google.com.
 
 Contributions to this project are welcomed. For more information about
 contributing to this project, see the [contribution guidelines](CONTRIBUTING.md).
-

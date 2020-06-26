@@ -18,28 +18,43 @@ import (
 	"time"
 
 	"github.com/google/exposure-notifications-server/internal/database"
+	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/setup"
+	"github.com/google/exposure-notifications-server/internal/storage"
+	"github.com/google/exposure-notifications-server/pkg/secrets"
 )
 
 // Compile-time check to assert this config matches requirements.
-var _ setup.BlobStorageConfigProvider = (*Config)(nil)
-var _ setup.DBConfigProvider = (*Config)(nil)
+var _ setup.BlobstoreConfigProvider = (*Config)(nil)
+var _ setup.DatabaseConfigProvider = (*Config)(nil)
+var _ setup.SecretManagerConfigProvider = (*Config)(nil)
+var _ setup.ObservabilityExporterConfigProvider = (*Config)(nil)
 
 // Config represents the configuration and associated environment variables for
 // the cleanup components.
 type Config struct {
-	Port     string        `envconfig:"PORT" default:"8080"`
-	Timeout  time.Duration `envconfig:"CLEANUP_TIMEOUT" default:"10m"`
-	TTL      time.Duration `envconfig:"CLEANUP_TTL" default:"336h"`
-	Database *database.Config
+	Database              database.Config
+	SecretManager         secrets.Config
+	Storage               storage.Config
+	ObservabilityExporter observability.Config
+
+	Port    string        `env:"PORT, default=8080"`
+	Timeout time.Duration `env:"CLEANUP_TIMEOUT, default=10m"`
+	TTL     time.Duration `env:"CLEANUP_TTL, default=336h"`
 }
 
-// DB return the databsae configuration.
-func (c *Config) DB() *database.Config {
-	return c.Database
+func (c *Config) BlobstoreConfig() *storage.Config {
+	return &c.Storage
 }
 
-// BlobStorage returns the BlobStorage configuration.
-func (c *Config) BlobStorage() bool {
-	return true
+func (c *Config) DatabaseConfig() *database.Config {
+	return &c.Database
+}
+
+func (c *Config) SecretManagerConfig() *secrets.Config {
+	return &c.SecretManager
+}
+
+func (c *Config) ObservabilityExporterConfig() *observability.Config {
+	return &c.ObservabilityExporter
 }

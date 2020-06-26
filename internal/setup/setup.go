@@ -12,98 +12,228 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Package setup provides common logic for configuring the various services.
 package setup
 
 import (
 	"context"
 	"fmt"
 
+	"github.com/google/exposure-notifications-server/internal/authorizedapp"
 	"github.com/google/exposure-notifications-server/internal/database"
-	"github.com/google/exposure-notifications-server/internal/dbapiconfig"
-	"github.com/google/exposure-notifications-server/internal/envconfig"
+	"github.com/google/exposure-notifications-server/internal/logging"
 	"github.com/google/exposure-notifications-server/internal/metrics"
-	"github.com/google/exposure-notifications-server/internal/secrets"
+	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/serverenv"
-	"github.com/google/exposure-notifications-server/internal/signing"
 	"github.com/google/exposure-notifications-server/internal/storage"
+	"github.com/google/exposure-notifications-server/pkg/keys"
+	"github.com/google/exposure-notifications-server/pkg/secrets"
+	"github.com/sethvargo/go-envconfig/pkg/envconfig"
 )
 
-// DBConfigProvider ensures that the envionment config can provide a DB config.
-// All binaries in this application connect to the databse via the same method.
-type DBConfigProvider interface {
-	DB() *database.Config
+// AuthorizedAppConfigProvider signals that the config provided knows how to
+// configure authorized apps.
+type AuthorizedAppConfigProvider interface {
+	AuthorizedAppConfig() *authorizedapp.Config
 }
 
-// DBAPIConfigProvider signals that the config provided knows how to configure
-// and requires a DB backed APIConfigProvider installed.
-type DBAPIConfigProvider interface {
-	API() *dbapiconfig.ConfigOpts
+// BlobstoreConfigProvider provides the information about current storage
+// configuration.
+type BlobstoreConfigProvider interface {
+	BlobstoreConfig() *storage.Config
 }
 
-// KeyManagerProvider is a marker interface indicating the KeyManagerProvider should be installed.
-type KeyManagerProvider interface {
-	KeyManager() bool
+// DatabaseConfigProvider ensures that the environment config can provide a DB config.
+// All binaries in this application connect to the database via the same method.
+type DatabaseConfigProvider interface {
+	DatabaseConfig() *database.Config
 }
 
-// BlobStorageConfigProvider is a marker interface indicating the BlobStorage interface should be installed.
-type BlobStorageConfigProvider interface {
-	BlobStorage() bool
+// KeyManagerConfigProvider is a marker interface indicating the key manager
+// should be installed.
+type KeyManagerConfigProvider interface {
+	KeyManagerConfig() *keys.Config
 }
 
-// Function returned from setup to be deferred until the caller exits.
-type Defer func()
+// ObservabilityExporterConfigProvider signals that the config knows how to configure an
+// observability exporter.
+type ObservabilityExporterConfigProvider interface {
+	ObservabilityExporterConfig() *observability.Config
+}
 
-// Setup runs common intitializion code for all servers.
-func Setup(ctx context.Context, config DBConfigProvider) (*serverenv.ServerEnv, Defer, error) {
-	// Can be changed with a different secret manager interface.
-	// TODO(mikehelmick): Make this extensible to other providers.
-	sm, err := secrets.NewGCPSecretManager(ctx)
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to connect to secret manager: %v", err)
-	}
+// SecretManagerConfigProvider signals that the config knows how to configure a
+// secret manager.
+type SecretManagerConfigProvider interface {
+	SecretManagerConfig() *secrets.Config
+}
 
-	if err := envconfig.Process(ctx, config, sm); err != nil {
-		return nil, nil, fmt.Errorf("error loading environment variables: %v", err)
-	}
+// Setup runs common initialization code for all servers. See SetupWith.
+func Setup(ctx context.Context, config interface{}) (*serverenv.ServerEnv, error) {
+	return SetupWith(ctx, config, envconfig.OsLookuper())
+}
 
-	// Start building serverenv opts
-	opts := []serverenv.Option{
-		serverenv.WithSecretManager(sm),
-		serverenv.WithMetricsExporter(metrics.NewLogsBasedFromContext),
-	}
+// SetupWith processes the given configuration using envconfig. It is
+// responsible for establishing database connections, resolving secrets, and
+// accessing app configs. The provided interface must implement the various
+// interfaces.
+func SetupWith(ctx context.Context, config interface{}, l envconfig.Lookuper) (*serverenv.ServerEnv, error) {
+	logger := logging.FromContext(ctx)
 
-	// TODO(mikehelmick): Make this extensible to other providers.
-	if _, ok := config.(KeyManagerProvider); ok {
-		km, err := signing.NewGCPKMS(ctx)
-		if err != nil {
-			return nil, nil, fmt.Errorf("unable to connect to key manager: %w", err)
+	// Build a list of mutators. This list will grow as we initialize more of the
+	// configuration, such as the secret manager.
+	var mutatorFuncs []envconfig.MutatorFunc
+
+	// Build a list of options to pass to the server env.
+	var serverEnvOpts []serverenv.Option
+
+	// TODO: support customizable metrics
+	serverEnvOpts = append(serverEnvOpts, serverenv.WithMetricsExporter(metrics.NewLogsBasedFromContext))
+
+	// Load the secret manager - this needs to be loaded first because other
+	// processors may require access to secrets.
+	var sm secrets.SecretManager
+	if provider, ok := config.(SecretManagerConfigProvider); ok {
+		logger.Info("configuring secret manager")
+
+		// The environment configuration defines which secret manager to use, so we
+		// need to process the envconfig in here. Once we know which secret manager
+		// to use, we can load the secret manager and then re-process (later) any
+		// secret:// references.
+		//
+		// NOTE: it is not possible to specify which secret manager to use via a
+		// secret:// reference. This configuration option must always be the
+		// plaintext string.
+		smConfig := provider.SecretManagerConfig()
+		if err := envconfig.ProcessWith(ctx, smConfig, l, mutatorFuncs...); err != nil {
+			return nil, fmt.Errorf("unable to process secret manager env: %w", err)
 		}
-		opts = append(opts, serverenv.WithKeyManager(km))
-	}
-	// TODO(mikehelmick): Make this extensible to other providers.
-	if _, ok := config.(BlobStorageConfigProvider); ok {
-		storage, err := storage.NewGoogleCloudStorage(ctx)
+
+		var err error
+		sm, err = secrets.SecretManagerFor(ctx, smConfig.SecretManagerType)
 		if err != nil {
-			return nil, nil, fmt.Errorf("unable to connect to storage system: %v", err)
+			return nil, fmt.Errorf("unable to connect to secret manager: %w", err)
 		}
-		opts = append(opts, serverenv.WithBlobStorage(storage))
+
+		// Enable caching, if a TTL was provided.
+		if ttl := smConfig.SecretCacheTTL; ttl > 0 {
+			sm, err = secrets.WrapCacher(ctx, sm, ttl)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create secret manager cache: %w", err)
+			}
+		}
+
+		// Enable secret expansion, if enabled.
+		if smConfig.SecretExpansion {
+			sm, err = secrets.WrapJSONExpander(ctx, sm)
+			if err != nil {
+				return nil, fmt.Errorf("unable to create json expander secret manager: %w", err)
+			}
+		}
+
+		// Update the mutators to process secrets.
+		mutatorFuncs = append(mutatorFuncs, secrets.Resolver(sm, smConfig))
+
+		// Update serverEnv setup.
+		serverEnvOpts = append(serverEnvOpts, serverenv.WithSecretManager(sm))
+
+		logger.Infow("secret manager", "config", smConfig)
 	}
 
-	db, err := database.NewFromEnv(ctx, config.DB())
-	if err != nil {
-		return nil, nil, fmt.Errorf("unable to connect to database: %v", err)
-	}
-	opts = append(opts, serverenv.WithDatabase(db))
+	// Load the key manager.
+	var km keys.KeyManager
+	if provider, ok := config.(KeyManagerConfigProvider); ok {
+		logger.Info("configuring key manager")
 
-	if apicfg, ok := config.(DBAPIConfigProvider); ok {
-		cfgProvider, err := dbapiconfig.NewConfigProvider(db, sm, apicfg.API())
+		kmConfig := provider.KeyManagerConfig()
+		if err := envconfig.ProcessWith(ctx, kmConfig, l, mutatorFuncs...); err != nil {
+			return nil, fmt.Errorf("unable to process key manager env: %w", err)
+		}
+
+		var err error
+		km, err = keys.KeyManagerFor(ctx, kmConfig.KeyManagerType)
 		if err != nil {
-			// APIConfig must come after DB due to dependency, ensure connection is closed
-			defer db.Close(ctx)
-			return nil, nil, fmt.Errorf("unable to create APIConfig provider: %v", err)
+			return nil, fmt.Errorf("unable to connect to key manager: %w", err)
 		}
-		opts = append(opts, serverenv.WithAPIConfigProvider(cfgProvider))
+
+		// Update serverEnv setup.
+		serverEnvOpts = append(serverEnvOpts, serverenv.WithKeyManager(km))
+
+		logger.Infow("key manager", "config", kmConfig)
 	}
 
-	return serverenv.New(ctx, opts...), func() { db.Close(ctx) }, nil
+	// Process first round of environment variables.
+	if err := envconfig.ProcessWith(ctx, config, l, mutatorFuncs...); err != nil {
+		return nil, fmt.Errorf("error loading environment variables: %w", err)
+	}
+	logger.Infow("provided", "config", config)
+
+	// Configure and initialize the observability exporter.
+	if provider, ok := config.(ObservabilityExporterConfigProvider); ok {
+		logger.Info("configuring observability exporter")
+		oeConfig := provider.ObservabilityExporterConfig()
+		oe, err := observability.NewFromEnv(ctx, oeConfig)
+		if err != nil {
+			return nil, fmt.Errorf("unable to create ObservabilityExporter provider: %v", err)
+		}
+		if err := oe.InitExportOnce(); err != nil {
+			return nil, fmt.Errorf("error initializing observability exporter: %v", err)
+		}
+
+		serverEnvOpts = append(serverEnvOpts, serverenv.WithObservabilityExporter(oe))
+
+		logger.Infow("observability exporter", "config", oeConfig)
+	}
+
+	// Configure blob storage.
+	if provider, ok := config.(BlobstoreConfigProvider); ok {
+		logger.Info("configuring blobstore")
+
+		bsConfig := provider.BlobstoreConfig()
+		blobStore, err := storage.BlobstoreFor(ctx, bsConfig.BlobstoreType)
+		if err != nil {
+			return nil, fmt.Errorf("unable to connect to storage system: %v", err)
+		}
+		blobStorage := serverenv.WithBlobStorage(blobStore)
+
+		// Update serverEnv setup.
+		serverEnvOpts = append(serverEnvOpts, blobStorage)
+
+		logger.Infow("blobstore", "config", bsConfig)
+	}
+
+	// Setup the database connection.
+	if provider, ok := config.(DatabaseConfigProvider); ok {
+		logger.Info("configuring database")
+
+		dbConfig := provider.DatabaseConfig()
+		db, err := database.NewFromEnv(ctx, dbConfig)
+		if err != nil {
+			return nil, fmt.Errorf("unable to connect to database: %v", err)
+		}
+
+		// Update serverEnv setup.
+		serverEnvOpts = append(serverEnvOpts, serverenv.WithDatabase(db))
+
+		logger.Infow("database", "config", dbConfig)
+
+		// AuthorizedApp must come after database setup due to the dependency.
+		if provider, ok := config.(AuthorizedAppConfigProvider); ok {
+			logger.Info("configuring authorizedapp")
+
+			aaConfig := provider.AuthorizedAppConfig()
+			aa, err := authorizedapp.NewDatabaseProvider(ctx, db, aaConfig, authorizedapp.WithSecretManager(sm))
+			if err != nil {
+				// Ensure the database is closed on an error.
+				defer db.Close(ctx)
+				return nil, fmt.Errorf("unable to create AuthorizedApp provider: %v", err)
+			}
+
+			// Update serverEnv setup.
+			serverEnvOpts = append(serverEnvOpts, serverenv.WithAuthorizedAppProvider(aa))
+
+			logger.Infow("authorizedapp", "config", aaConfig)
+		}
+	}
+
+	return serverenv.New(ctx, serverEnvOpts...), nil
 }

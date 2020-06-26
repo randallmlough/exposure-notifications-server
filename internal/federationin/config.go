@@ -19,7 +19,9 @@ import (
 	"time"
 
 	"github.com/google/exposure-notifications-server/internal/database"
+	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/setup"
+	"github.com/google/exposure-notifications-server/pkg/secrets"
 )
 
 const (
@@ -35,28 +37,43 @@ var (
 )
 
 // Compile-time check to assert this config matches requirements.
-var _ setup.DBConfigProvider = (*Config)(nil)
+var _ setup.DatabaseConfigProvider = (*Config)(nil)
+var _ setup.SecretManagerConfigProvider = (*Config)(nil)
+var _ setup.ObservabilityExporterConfigProvider = (*Config)(nil)
 
 // Config is the configuration for federation-pull components (data pulled from other servers).
 type Config struct {
-	Database       *database.Config
-	Port           string        `envconfig:"PORT" default:"8080"`
-	Timeout        time.Duration `envconfig:"RPC_TIMEOUT" default:"10m"`
-	TruncateWindow time.Duration `envconfig:"TRUNCATE_WINDOW" default:"1h"`
+	Database              database.Config
+	SecretManager         secrets.Config
+	ObservabilityExporter observability.Config
 
-	// TLSSkipVerify, if set to true, causes the server certificate to not be verified.
-	// This is typically used when testing locally with self-signed certificates.
-	TLSSkipVerify bool `envconfig:"TLS_SKIP_VERIFY" default:"false"`
+	Port           string        `env:"PORT, default=8080"`
+	Timeout        time.Duration `env:"RPC_TIMEOUT, default=10m"`
+	TruncateWindow time.Duration `env:"TRUNCATE_WINDOW, default=1h"`
 
-	// TLSCertFile points to an optional cert file that will be appended to the system certificates.
-	TLSCertFile string `envconfig:"TLS_CERT_FILE"`
+	// TLSSkipVerify, if set to true, causes the server certificate to not be
+	// verified. This is typically used when testing locally with self-signed
+	// certificates.
+	TLSSkipVerify bool `env:"TLS_SKIP_VERIFY"`
 
-	// CredentialsFile points to a JSON credentials file. If running on Managed Cloud Run,
-	// or if using $GOOGLE_APPLICATION_CREDENTIALS, leave this value empty.
-	CredentialsFile string `envconfig:"CREDENTIALS_FILE"`
+	// TLSCertFile points to an optional cert file that will be appended to the
+	// system certificates.
+	TLSCertFile string `env:"TLS_CERT_FILE"`
+
+	// CredentialsFile points to a JSON credentials file. If running on Managed
+	// Cloud Run, or if using $GOOGLE_APPLICATION_CREDENTIALS, leave this value
+	// empty.
+	CredentialsFile string `env:"CREDENTIALS_FILE"`
 }
 
-// DB returns the database config.
-func (c *Config) DB() *database.Config {
-	return c.Database
+func (c *Config) DatabaseConfig() *database.Config {
+	return &c.Database
+}
+
+func (c *Config) SecretManagerConfig() *secrets.Config {
+	return &c.SecretManager
+}
+
+func (c *Config) ObservabilityExporterConfig() *observability.Config {
+	return &c.ObservabilityExporter
 }

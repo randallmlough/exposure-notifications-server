@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This utility unwrapps the export.TEKSignatureList proto and
-// extracts the sianature so that an export file can be verified with openssl.
+// This utility unwraps the export.TEKSignatureList proto and
+// extracts the signature so that an export file can be verified with openssl.
 package main
 
 import (
@@ -46,7 +46,9 @@ func main() {
 	}
 
 	teksl := &export.TEKSignatureList{}
-	proto.Unmarshal(inData, teksl)
+	if err := proto.Unmarshal(inData, teksl); err != nil {
+		log.Fatalf("failed to unmarshal proto: %v", err)
+	}
 
 	log.Printf("Data: \n%v", teksl)
 	sig := teksl.Signatures[0].Signature

@@ -16,24 +16,17 @@
 package main
 
 import (
-	"bytes"
-	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
+	"io/ioutil"
 	"log"
-	"math/big"
-	"net/http"
 	"strings"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/model"
-)
-
-const (
-	// the length of a diagnosis key, always 16 bytes
-	dkLen               = 16
-	maxTransmissionRisk = 8
+	"github.com/google/exposure-notifications-server/internal/util"
+	verifyapi "github.com/google/exposure-notifications-server/pkg/api/v1alpha1"
+	"github.com/google/exposure-notifications-server/testing/enclient"
 )
 
 var (
@@ -64,9 +57,11 @@ var (
 func main() {
 	flag.Parse()
 
-	exposureKeys := generateExposureKeys(*numKeys, *transmissionRiskFlag)
-
-	regionIdx := randomInt(len(defaultRegions))
+	exposureKeys := util.GenerateExposureKeys(*numKeys, *transmissionRiskFlag, false)
+	regionIdx, err := util.RandomInt(len(defaultRegions))
+	if err != nil {
+		log.Printf("error getting random region: %v", err)
+	}
 	region := defaultRegions[regionIdx]
 	if *regions != "" {
 		region = strings.Split(*regions, ",")
@@ -74,112 +69,56 @@ func main() {
 
 	verificationAuthorityName := *authorityName
 	if verificationAuthorityName == "" {
-		verificationAuthorityName = randomArrValue(verificationAuthorityNames)
+		verificationAuthorityName, err = util.RandomArrValue(verificationAuthorityNames)
+		if err != nil {
+			log.Printf("could not get random verification authority: %v", err)
+		}
 	}
 
-	padding := make([]byte, randomInt(1000)+1000)
-	_, err := rand.Read(padding)
+	i, err := util.RandomInt(1000)
 	if err != nil {
-		log.Printf("error generating padding: %v", err)
+		log.Printf("error getting random int: %v", err)
 	}
-
-	data := model.Publish{
-		Keys:           exposureKeys,
-		Regions:        region,
-		AppPackageName: *appPackage,
-		// This tool cannot generate valid safetynet attestations.
-		DeviceVerificationPayload: "some invalid data",
-		VerificationPayload:       verificationAuthorityName,
-		Padding:                   base64.RawStdEncoding.EncodeToString(padding),
-	}
-
-	jsonData, err := json.Marshal(data)
+	padding, err := util.RandomBytes(i + 1000)
 	if err != nil {
-		log.Fatalf("unable to marshal json payload")
+		log.Printf("could not get random padding: %v", err)
 	}
 
-	sendRequest(jsonData)
+	data := verifyapi.Publish{
+		Keys:                exposureKeys,
+		Regions:             region,
+		AppPackageName:      *appPackage,
+		VerificationPayload: verificationAuthorityName,
+		Padding:             base64.RawStdEncoding.EncodeToString(padding),
+	}
 
 	prettyJSON, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
 		log.Printf("Can't display JSON that was sent, error: %v", err)
 	} else {
-		log.Printf("payload: \n%v", string(prettyJSON))
+		log.Printf("SENDING: \n%v", string(prettyJSON))
 	}
+
+	sendRequest(data)
 
 	if *twice {
 		time.Sleep(1 * time.Second)
 		log.Printf("sending the request again...")
-		sendRequest(jsonData)
+		sendRequest(data)
 	}
 }
 
-func randIntervalCount() int32 {
-	n, err := rand.Int(rand.Reader, big.NewInt(144))
+func sendRequest(data interface{}) {
+	resp, err := enclient.PostRequest(*url, data)
 	if err != nil {
-		log.Fatalf("rand.Int: %v", err)
+		log.Fatalf("request failed: %v, %v", err, resp)
+		return
 	}
-	return int32(n.Int64() + 1) // valid values are 1-144
-}
 
-func randomInt(maxValue int) int {
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(maxValue)))
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Fatalf("rand.Int: %v", err)
-	}
-	return int(n.Int64())
-}
-
-func randomArrValue(arr []string) string {
-	return arr[randomInt(len(arr))]
-}
-
-func generateExposureKeys(numKeys, tr int) []model.ExposureKey {
-	keys := make([][]byte, numKeys)
-	for i := 0; i < numKeys; i++ {
-		keys[i] = make([]byte, dkLen)
-		_, err := rand.Read(keys[i])
-		if err != nil {
-			log.Fatalf("rand.Read: %v", err)
-		}
-	}
-
-	// When publishing multiple keys - they'll be on different days.
-	intervalCount := randIntervalCount()
-	intervalNumber := int32(time.Now().Unix()/600) - intervalCount
-	exposureKeys := make([]model.ExposureKey, numKeys)
-	for i, rawKey := range keys {
-		transmissionRisk := tr
-		if transmissionRisk < 0 {
-			transmissionRisk = randomInt(maxTransmissionRisk) + 1
-		}
-
-		exposureKeys[i].Key = base64.StdEncoding.EncodeToString(rawKey)
-		exposureKeys[i].IntervalNumber = intervalNumber
-		exposureKeys[i].IntervalCount = intervalCount
-		exposureKeys[i].TransmissionRisk = transmissionRisk
-		// Adjust interval math for next key.
-		intervalCount = randIntervalCount()
-		intervalNumber -= intervalCount
-	}
-	return exposureKeys
-}
-
-func sendRequest(jsonData []byte) {
-	r, err := http.NewRequest("POST", *url, bytes.NewBuffer(jsonData))
-	if err != nil {
-		log.Fatalf("error creating http request, %v", err)
-	}
-	r.Header.Set("Content-Type", "application/json")
-	client := &http.Client{}
-	resp, err := client.Do(r)
-	if err != nil {
-		log.Fatalf("error on http request: %v", err)
-	}
-	defer resp.Body.Close()
-
-	log.Printf("response: %v", resp.Status)
-	if resp.StatusCode != http.StatusOK {
-		log.Fatalf("Failure response from server.")
+		log.Printf("unable to read http response: %v", err)
+	} else {
+		log.Printf("response: %v", string(body))
 	}
 }

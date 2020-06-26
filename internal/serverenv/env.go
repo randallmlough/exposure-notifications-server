@@ -20,12 +20,13 @@ import (
 	"crypto"
 	"fmt"
 
-	"github.com/google/exposure-notifications-server/internal/config"
+	"github.com/google/exposure-notifications-server/internal/authorizedapp"
 	"github.com/google/exposure-notifications-server/internal/database"
 	"github.com/google/exposure-notifications-server/internal/metrics"
-	"github.com/google/exposure-notifications-server/internal/secrets"
-	"github.com/google/exposure-notifications-server/internal/signing"
+	"github.com/google/exposure-notifications-server/internal/observability"
 	"github.com/google/exposure-notifications-server/internal/storage"
+	"github.com/google/exposure-notifications-server/pkg/keys"
+	"github.com/google/exposure-notifications-server/pkg/secrets"
 )
 
 // ExporterFunc defines a factory function for creating a context aware metrics exporter.
@@ -33,12 +34,13 @@ type ExporterFunc func(context.Context) metrics.Exporter
 
 // ServerEnv represents latent environment configuration for servers in this application.
 type ServerEnv struct {
-	secretManager     secrets.SecretManager
-	keyManager        signing.KeyManager
-	blobstore         storage.Blobstore
-	exporter          metrics.ExporterFromContext
-	apiConfigProvider config.Provider
-	database          *database.DB
+	authorizedAppProvider authorizedapp.Provider
+	blobstore             storage.Blobstore
+	database              *database.DB
+	exporter              metrics.ExporterFromContext
+	keyManager            keys.KeyManager
+	secretManager         secrets.SecretManager
+	observabilityExporter observability.Exporter
 }
 
 // Option defines function types to modify the ServerEnv on creation.
@@ -68,10 +70,10 @@ func WithDatabase(db *database.DB) Option {
 	}
 }
 
-// WithAPIConfigProvider installs a provider of APIConfig.
-func WithAPIConfigProvider(p config.Provider) Option {
+// WithAuthorizedAppProvider installs a provider for an authorized app.
+func WithAuthorizedAppProvider(p authorizedapp.Provider) Option {
 	return func(s *ServerEnv) *ServerEnv {
-		s.apiConfigProvider = p
+		s.authorizedAppProvider = p
 		return s
 	}
 }
@@ -93,7 +95,7 @@ func WithSecretManager(sm secrets.SecretManager) Option {
 }
 
 // WithKeyManager creates an Option to install a specific KeyManager to use for signing requests.
-func WithKeyManager(km signing.KeyManager) Option {
+func WithKeyManager(km keys.KeyManager) Option {
 	return func(s *ServerEnv) *ServerEnv {
 		s.keyManager = km
 		return s
@@ -108,11 +110,19 @@ func WithBlobStorage(sto storage.Blobstore) Option {
 	}
 }
 
+// WithObservabilityExporter creates an Option to install a specific observability exporter system.
+func WithObservabilityExporter(oe observability.Exporter) Option {
+	return func(s *ServerEnv) *ServerEnv {
+		s.observabilityExporter = oe
+		return s
+	}
+}
+
 func (s *ServerEnv) SecretManager() secrets.SecretManager {
 	return s.secretManager
 }
 
-func (s *ServerEnv) KeyManager() signing.KeyManager {
+func (s *ServerEnv) KeyManager() keys.KeyManager {
 	return s.keyManager
 }
 
@@ -120,12 +130,16 @@ func (s *ServerEnv) Blobstore() storage.Blobstore {
 	return s.blobstore
 }
 
-func (s *ServerEnv) APIConfigProvider() config.Provider {
-	return s.apiConfigProvider
+func (s *ServerEnv) AuthorizedAppProvider() authorizedapp.Provider {
+	return s.authorizedAppProvider
 }
 
 func (s *ServerEnv) Database() *database.DB {
 	return s.database
+}
+
+func (s *ServerEnv) ObservabilityExporter() observability.Exporter {
+	return s.observabilityExporter
 }
 
 // GetSignerForKey returns the crypto.Singer implementation to use based on the installed KeyManager.
@@ -147,4 +161,16 @@ func (s *ServerEnv) MetricsExporter(ctx context.Context) metrics.Exporter {
 		return nil
 	}
 	return s.exporter(ctx)
+}
+
+// Close shuts down the server env, closing database connections, etc.
+func (s *ServerEnv) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+
+	if s.database != nil {
+		s.database.Close(ctx)
+	}
+	return nil
 }

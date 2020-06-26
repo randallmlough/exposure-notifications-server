@@ -19,9 +19,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/database"
+	"github.com/google/exposure-notifications-server/internal/federationin/database"
+	"github.com/google/exposure-notifications-server/internal/federationin/model"
+	publishmodel "github.com/google/exposure-notifications-server/internal/publish/model"
+
 	"github.com/google/exposure-notifications-server/internal/metrics"
-	"github.com/google/exposure-notifications-server/internal/model"
 	"github.com/google/exposure-notifications-server/internal/pb"
 
 	"github.com/google/go-cmp/cmp"
@@ -32,18 +34,15 @@ import (
 var (
 	syncID int64 = 999
 
-	posver  = pb.TransmissionRisk_positive_verified
-	selfver = pb.TransmissionRisk_self_reported
-
 	aaa = &pb.ExposureKey{ExposureKey: []byte("aaa"), IntervalNumber: 1}
 	bbb = &pb.ExposureKey{ExposureKey: []byte("bbb"), IntervalNumber: 2}
 	ccc = &pb.ExposureKey{ExposureKey: []byte("ccc"), IntervalNumber: 3}
 	ddd = &pb.ExposureKey{ExposureKey: []byte("ddd"), IntervalNumber: 4}
 )
 
-// makeRemoteExposure returns a mock model.Exposure with LocalProvenance=false.
-func makeRemoteExposure(diagKey *pb.ExposureKey, diagStatus pb.TransmissionRisk, verificationAuthorityName string, regions ...string) *model.Exposure {
-	inf := makeExposureWithVerification(diagKey, diagStatus, verificationAuthorityName, regions...)
+// makeRemoteExposure returns a mock publishmodel.Exposure with LocalProvenance=false.
+func makeRemoteExposure(diagKey *pb.ExposureKey, diagStatus int, regions ...string) *publishmodel.Exposure {
+	inf := makeExposure(diagKey, diagStatus, regions...)
 	inf.LocalProvenance = false
 	inf.FederationSyncID = syncID
 	return inf
@@ -66,12 +65,12 @@ func (r *remoteFetchServer) fetch(ctx context.Context, req *pb.FederationFetchRe
 	return response, nil
 }
 
-// exposureDB mocks the database, recording exposure insertions.
-type exposureDB struct {
-	exposures []*model.Exposure
+// publishDB mocks the database, recording exposure insertions.
+type publishDB struct {
+	exposures []*publishmodel.Exposure
 }
 
-func (idb *exposureDB) insertExposures(ctx context.Context, exposures []*model.Exposure) error {
+func (idb *publishDB) insertExposures(ctx context.Context, exposures []*publishmodel.Exposure) error {
 	idb.exposures = append(idb.exposures, exposures...)
 	return nil
 }
@@ -90,7 +89,7 @@ func (sdb *syncDB) startFederationSync(ctx context.Context, query *model.Federat
 	timerStart := time.Now()
 	return syncID, func(maxTimestamp time.Time, totalInserted int) error {
 		sdb.syncCompleted = true
-		sdb.completed = start.Add(time.Now().Sub(timerStart))
+		sdb.completed = start.Add(time.Since(timerStart))
 		sdb.maxTimestamp = maxTimestamp
 		sdb.totalInserted = totalInserted
 		return nil
@@ -103,7 +102,7 @@ func TestFederationPull(t *testing.T) {
 		name             string
 		batchSize        int
 		fetchResponses   []*pb.FederationFetchResponse
-		wantExposures    []*model.Exposure
+		wantExposures    []*publishmodel.Exposure
 		wantTokens       []string
 		wantMaxTimestamp time.Time
 	}{
@@ -119,19 +118,19 @@ func TestFederationPull(t *testing.T) {
 					Response: []*pb.ContactTracingResponse{
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+								{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "AAA", ExposureKeys: []*pb.ExposureKey{ccc}},
+								{TransmissionRisk: 2, ExposureKeys: []*pb.ExposureKey{ccc}},
 							},
 							RegionIdentifiers: []string{"US", "CA"},
 						},
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: selfver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{ddd}},
+								{TransmissionRisk: 3, ExposureKeys: []*pb.ExposureKey{ddd}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
@@ -139,11 +138,45 @@ func TestFederationPull(t *testing.T) {
 					FetchResponseKeyTimestamp: 400,
 				},
 			},
-			wantExposures: []*model.Exposure{
-				makeRemoteExposure(aaa, posver, "", "US"),
-				makeRemoteExposure(bbb, posver, "", "US"),
-				makeRemoteExposure(ccc, posver, "AAA", "CA", "US"),
-				makeRemoteExposure(ddd, selfver, "", "US"),
+			wantExposures: []*publishmodel.Exposure{
+				makeRemoteExposure(aaa, 1, "US"),
+				makeRemoteExposure(bbb, 1, "US"),
+				makeRemoteExposure(ccc, 2, "CA", "US"),
+				makeRemoteExposure(ddd, 3, "US"),
+			},
+			wantTokens:       []string{""},
+			wantMaxTimestamp: time.Unix(400, 0),
+		},
+		{
+			name: "invalid transmission risk",
+			fetchResponses: []*pb.FederationFetchResponse{
+				{
+					Response: []*pb.ContactTracingResponse{
+						{
+							ContactTracingInfo: []*pb.ContactTracingInfo{
+								{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+							},
+							RegionIdentifiers: []string{"US"},
+						},
+						{
+							ContactTracingInfo: []*pb.ContactTracingInfo{
+								{TransmissionRisk: -1, ExposureKeys: []*pb.ExposureKey{ccc}},
+							},
+							RegionIdentifiers: []string{"US", "CA"},
+						},
+						{
+							ContactTracingInfo: []*pb.ContactTracingInfo{
+								{TransmissionRisk: 9, ExposureKeys: []*pb.ExposureKey{ddd}},
+							},
+							RegionIdentifiers: []string{"US"},
+						},
+					},
+					FetchResponseKeyTimestamp: 400,
+				},
+			},
+			wantExposures: []*publishmodel.Exposure{
+				makeRemoteExposure(aaa, 1, "US"),
+				makeRemoteExposure(bbb, 1, "US"),
 			},
 			wantTokens:       []string{""},
 			wantMaxTimestamp: time.Unix(400, 0),
@@ -157,7 +190,7 @@ func TestFederationPull(t *testing.T) {
 					Response: []*pb.ContactTracingResponse{
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+								{TransmissionRisk: 8, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
@@ -168,13 +201,13 @@ func TestFederationPull(t *testing.T) {
 					Response: []*pb.ContactTracingResponse{
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{ccc}},
+								{TransmissionRisk: 7, ExposureKeys: []*pb.ExposureKey{ccc}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: selfver, VerificationAuthorityName: "AAA", ExposureKeys: []*pb.ExposureKey{ddd}},
+								{TransmissionRisk: 6, ExposureKeys: []*pb.ExposureKey{ddd}},
 							},
 							RegionIdentifiers: []string{"CA"},
 						},
@@ -182,11 +215,11 @@ func TestFederationPull(t *testing.T) {
 					FetchResponseKeyTimestamp: 400,
 				},
 			},
-			wantExposures: []*model.Exposure{
-				makeRemoteExposure(aaa, posver, "", "US"),
-				makeRemoteExposure(bbb, posver, "", "US"),
-				makeRemoteExposure(ccc, posver, "", "US"),
-				makeRemoteExposure(ddd, selfver, "AAA", "CA"),
+			wantExposures: []*publishmodel.Exposure{
+				makeRemoteExposure(aaa, 8, "US"),
+				makeRemoteExposure(bbb, 8, "US"),
+				makeRemoteExposure(ccc, 7, "US"),
+				makeRemoteExposure(ddd, 6, "CA"),
 			},
 			wantTokens:       []string{"", "abcdef"},
 			wantMaxTimestamp: time.Unix(400, 0),
@@ -199,19 +232,19 @@ func TestFederationPull(t *testing.T) {
 					Response: []*pb.ContactTracingResponse{
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+								{TransmissionRisk: 3, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: posver, VerificationAuthorityName: "AAA", ExposureKeys: []*pb.ExposureKey{ccc}},
+								{TransmissionRisk: 2, ExposureKeys: []*pb.ExposureKey{ccc}},
 							},
 							RegionIdentifiers: []string{"US", "CA"},
 						},
 						{
 							ContactTracingInfo: []*pb.ContactTracingInfo{
-								{TransmissionRisk: selfver, VerificationAuthorityName: "", ExposureKeys: []*pb.ExposureKey{ddd}},
+								{TransmissionRisk: 5, ExposureKeys: []*pb.ExposureKey{ddd}},
 							},
 							RegionIdentifiers: []string{"US"},
 						},
@@ -219,11 +252,11 @@ func TestFederationPull(t *testing.T) {
 					FetchResponseKeyTimestamp: 400,
 				},
 			},
-			wantExposures: []*model.Exposure{
-				makeRemoteExposure(aaa, posver, "", "US"),
-				makeRemoteExposure(bbb, posver, "", "US"),
-				makeRemoteExposure(ccc, posver, "AAA", "CA", "US"),
-				makeRemoteExposure(ddd, selfver, "", "US"),
+			wantExposures: []*publishmodel.Exposure{
+				makeRemoteExposure(aaa, 3, "US"),
+				makeRemoteExposure(bbb, 3, "US"),
+				makeRemoteExposure(ccc, 2, "CA", "US"),
+				makeRemoteExposure(ddd, 5, "US"),
 			},
 			wantTokens:       []string{""},
 			wantMaxTimestamp: time.Unix(400, 0),
@@ -235,7 +268,7 @@ func TestFederationPull(t *testing.T) {
 			ctx := context.Background()
 			query := &model.FederationInQuery{}
 			remote := remoteFetchServer{responses: tc.fetchResponses}
-			idb := exposureDB{}
+			idb := publishDB{}
 			sdb := syncDB{}
 			batchStart := time.Now()
 			if tc.batchSize > 0 {
@@ -243,18 +276,24 @@ func TestFederationPull(t *testing.T) {
 				fetchBatchSize = tc.batchSize
 				defer func() { fetchBatchSize = oldBatchSize }()
 			}
-			deps := pullDependencies{
-				fetch:               remote.fetch,
-				insertExposures:     idb.insertExposures,
-				startFederationSync: sdb.startFederationSync,
+
+			opts := pullOptions{
+				deps: pullDependencies{
+					fetch:               remote.fetch,
+					insertExposures:     idb.insertExposures,
+					startFederationSync: sdb.startFederationSync,
+				},
+				query:          query,
+				batchStart:     batchStart,
+				truncateWindow: time.Hour,
 			}
 
-			err := pull(ctx, metrics.NewLogsBasedFromContext(ctx), deps, query, batchStart, time.Hour)
+			err := pull(ctx, metrics.NewLogsBasedFromContext(ctx), &opts)
 			if err != nil {
 				t.Fatalf("pull returned err=%v, want err=nil", err)
 			}
 
-			if diff := cmp.Diff(tc.wantExposures, idb.exposures, cmpopts.IgnoreFields(model.Exposure{}, "CreatedAt")); diff != "" {
+			if diff := cmp.Diff(tc.wantExposures, idb.exposures, cmpopts.IgnoreFields(publishmodel.Exposure{}, "CreatedAt")); diff != "" {
 				t.Errorf("exposures mismatch (-want +got):\n%s", diff)
 			}
 			if diff := cmp.Diff(tc.wantTokens, remote.gotTokens); diff != "" {
@@ -279,19 +318,13 @@ func TestFederationPull(t *testing.T) {
 	}
 }
 
-func makeExposure(diagKey *pb.ExposureKey, diagStatus pb.TransmissionRisk, regions ...string) *model.Exposure {
-	return &model.Exposure{
+func makeExposure(diagKey *pb.ExposureKey, diagStatus int, regions ...string) *publishmodel.Exposure {
+	return &publishmodel.Exposure{
 		Regions:          regions,
-		TransmissionRisk: int(diagStatus),
+		TransmissionRisk: diagStatus,
 		ExposureKey:      diagKey.ExposureKey,
 		IntervalNumber:   diagKey.IntervalNumber,
 		CreatedAt:        time.Unix(int64(diagKey.IntervalNumber*100), 0), // Make unique from IntervalNumber.
 		LocalProvenance:  true,
 	}
-}
-
-func makeExposureWithVerification(diagKey *pb.ExposureKey, diagStatus pb.TransmissionRisk, verificationAuthorityName string, regions ...string) *model.Exposure {
-	inf := makeExposure(diagKey, diagStatus, regions...)
-	inf.VerificationAuthorityName = verificationAuthorityName
-	return inf
 }

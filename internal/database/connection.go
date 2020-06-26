@@ -18,7 +18,6 @@ package database
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"strings"
 	"time"
 
@@ -27,26 +26,8 @@ import (
 	"github.com/jackc/pgx/v4/pgxpool"
 )
 
-var (
-	validSSLModes = []string{
-		"disable",     // No SSL
-		"require",     // Always SSL (skip verification)
-		"verify-ca",   // Always SSL (verify that the certificate presented by the server was signed by a trusted CA)
-		"verify-full", // Always SSL (verify that the certification presented by
-	}
-)
-
-type config struct {
-	env       string
-	part      string
-	def       interface{}
-	req       bool
-	valid     []string
-	writeFile bool
-}
-
 type DB struct {
-	pool *pgxpool.Pool
+	Pool *pgxpool.Pool
 }
 
 // NewFromEnv sets up the database connections using the configuration in the
@@ -57,44 +38,32 @@ func NewFromEnv(ctx context.Context, config *Config) (*DB, error) {
 	logger := logging.FromContext(ctx)
 	logger.Infof("Creating connection pool.")
 
-	connStr, err := dbConnectionString(ctx, config)
-
-	if err != nil {
-		return nil, fmt.Errorf("invalid database config: %v", err)
-	}
+	connStr := dbConnectionString(config)
 
 	pool, err := pgxpool.Connect(ctx, connStr)
 	if err != nil {
 		return nil, fmt.Errorf("creating connection pool: %v", err)
 	}
 
-	return &DB{pool: pool}, nil
+	return &DB{Pool: pool}, nil
 }
 
 // Close releases database connections.
 func (db *DB) Close(ctx context.Context) {
 	logger := logging.FromContext(ctx)
 	logger.Infof("Closing connection pool.")
-	db.pool.Close()
+	db.Pool.Close()
 }
 
 // dbConnectionString builds a connection string suitable for the pgx Postgres driver, using the
 // values of vars.
-func dbConnectionString(ctx context.Context, config *Config) (string, error) {
+func dbConnectionString(config *Config) string {
 	vals := dbValues(config)
 	var p []string
 	for k, v := range vals {
 		p = append(p, fmt.Sprintf("%s=%s", k, v))
 	}
-	return strings.Join(p, " "), nil
-}
-
-// dbURI builds a Postgres URI suitable for the lib/pq driver, which is used by
-// github.com/golang-migrate/migrate.
-func dbURI(config *Config) string {
-	return fmt.Sprintf("postgres://%s/%s?sslmode=disable&user=%s&password=%s&port=%s",
-		config.Host, config.Name, config.User,
-		url.QueryEscape(config.Password), url.QueryEscape(config.Port))
+	return strings.Join(p, " ")
 }
 
 func setIfNotEmpty(m map[string]string, key, val string) {

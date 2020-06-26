@@ -14,10 +14,11 @@
 
 syntax = "proto3";
 
-option go_package = "internal/pb;pb";
+option go_package = "github.com/google/exposure-notifications-server/internal/pb;pb";
 
 message FederationFetchRequest {
-	string fetchType = 1; // required
+	// fetchType is not used in the federation API and will be removed.
+	string fetchType = 1 [deprecated = true];
 	repeated string regionIdentifiers = 2;
 	repeated string excludeRegionIdentifiers = 3;
 	int64 lastFetchResponseKeyTimestamp = 4; // required
@@ -39,16 +40,9 @@ message ContactTracingResponse {
 }
 
 message ContactTracingInfo {
-	// TODO(squee1945 | mikehelmick): this should be an int now.
-	TransmissionRisk transmissionRisk = 1;  // required
+  // Transmission risk is an integer with valid values from 1-8.
+	int32 transmissionRisk = 1;  // required
 	repeated ExposureKey exposureKeys = 2;
-	string verificationAuthorityName = 3;  // TODO(squee1945): need to group on this.
-}
-
-enum TransmissionRisk {
-	unknown = 0;
-	positive_verified = 1;
-	self_reported = 2;
 }
 
 message ExposureKey {

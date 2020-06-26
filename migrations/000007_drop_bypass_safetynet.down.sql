@@ -15,6 +15,6 @@
 BEGIN;
 
 ALTER TABLE APIConfig
-  ADD COLUMN bypass_safetynet bool NOT NULL;
+  ADD COLUMN bypass_safetynet bool DEFAULT false;
 
 END;

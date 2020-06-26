@@ -20,8 +20,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/google/exposure-notifications-server/internal/database"
-	"github.com/google/exposure-notifications-server/internal/model"
+	"github.com/google/exposure-notifications-server/internal/publish/database"
+
+	"github.com/google/exposure-notifications-server/internal/publish/model"
+
 	"github.com/google/exposure-notifications-server/internal/pb"
 	"github.com/google/exposure-notifications-server/internal/serverenv"
 	"google.golang.org/grpc/metadata"
@@ -39,9 +41,6 @@ var (
 		protocmp.SortRepeatedFields(&pb.ContactTracingInfo{}, "exposureKeys"),
 	}
 
-	posver  = pb.TransmissionRisk_positive_verified
-	selfver = pb.TransmissionRisk_self_reported
-
 	aaa = &pb.ExposureKey{ExposureKey: []byte("aaa"), IntervalNumber: 1}
 	bbb = &pb.ExposureKey{ExposureKey: []byte("bbb"), IntervalNumber: 2}
 	ccc = &pb.ExposureKey{ExposureKey: []byte("ccc"), IntervalNumber: 3}
@@ -49,21 +48,15 @@ var (
 )
 
 // makeExposure returns a mock model.Exposure.
-func makeExposure(diagKey *pb.ExposureKey, diagStatus pb.TransmissionRisk, regions ...string) *model.Exposure {
+func makeExposure(diagKey *pb.ExposureKey, diagStatus int, regions ...string) *model.Exposure {
 	return &model.Exposure{
 		Regions:          regions,
-		TransmissionRisk: int(diagStatus),
+		TransmissionRisk: diagStatus,
 		ExposureKey:      diagKey.ExposureKey,
 		IntervalNumber:   diagKey.IntervalNumber,
 		CreatedAt:        time.Unix(int64(diagKey.IntervalNumber*100), 0), // Make unique from IntervalNumber.
 		LocalProvenance:  true,
 	}
-}
-
-func makeExposureWithVerification(diagKey *pb.ExposureKey, diagStatus pb.TransmissionRisk, verificationAuthorityName string, regions ...string) *model.Exposure {
-	inf := makeExposure(diagKey, diagStatus, regions...)
-	inf.VerificationAuthorityName = verificationAuthorityName
-	return inf
 }
 
 // timeout is used by testIterator to indicate that a timeout signal should be sent.
@@ -96,38 +89,38 @@ func TestFetch(t *testing.T) {
 		name           string
 		excludeRegions []string
 		iterations     []interface{}
-		want           pb.FederationFetchResponse
+		want           *pb.FederationFetchResponse
 	}{
 		{
 			name: "no results",
-			want: pb.FederationFetchResponse{},
+			want: &pb.FederationFetchResponse{},
 		},
 		{
 			name: "basic results",
 			iterations: []interface{}{
-				makeExposure(aaa, posver, "US"),
-				makeExposure(bbb, posver, "US"),
-				makeExposure(ccc, posver, "GB"),
-				makeExposure(ddd, posver, "US", "GB"),
+				makeExposure(aaa, 1, "US"),
+				makeExposure(bbb, 1, "US"),
+				makeExposure(ccc, 3, "GB"),
+				makeExposure(ddd, 4, "US", "GB"),
 			},
-			want: pb.FederationFetchResponse{
+			want: &pb.FederationFetchResponse{
 				Response: []*pb.ContactTracingResponse{
 					{
 						RegionIdentifiers: []string{"US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+							{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
 						},
 					},
 					{
 						RegionIdentifiers: []string{"GB"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{ccc}},
+							{TransmissionRisk: 3, ExposureKeys: []*pb.ExposureKey{ccc}},
 						},
 					},
 					{
 						RegionIdentifiers: []string{"GB", "US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{ddd}},
+							{TransmissionRisk: 4, ExposureKeys: []*pb.ExposureKey{ddd}},
 						},
 					},
 				},
@@ -137,24 +130,24 @@ func TestFetch(t *testing.T) {
 		{
 			name: "results combined on status",
 			iterations: []interface{}{
-				makeExposure(aaa, posver, "US"),
-				makeExposure(bbb, posver, "US"),
-				makeExposure(ccc, selfver, "US"),
-				makeExposure(ddd, selfver, "CA"),
+				makeExposure(aaa, 8, "US"),
+				makeExposure(bbb, 8, "US"),
+				makeExposure(ccc, 6, "US"),
+				makeExposure(ddd, 5, "CA"),
 			},
-			want: pb.FederationFetchResponse{
+			want: &pb.FederationFetchResponse{
 				Response: []*pb.ContactTracingResponse{
 					{
 						RegionIdentifiers: []string{"US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
-							{TransmissionRisk: selfver, ExposureKeys: []*pb.ExposureKey{ccc}},
+							{TransmissionRisk: 8, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+							{TransmissionRisk: 6, ExposureKeys: []*pb.ExposureKey{ccc}},
 						},
 					},
 					{
 						RegionIdentifiers: []string{"CA"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: selfver, ExposureKeys: []*pb.ExposureKey{ddd}},
+							{TransmissionRisk: 5, ExposureKeys: []*pb.ExposureKey{ddd}},
 						},
 					},
 				},
@@ -164,19 +157,19 @@ func TestFetch(t *testing.T) {
 		{
 			name: "results combined on status and verification",
 			iterations: []interface{}{
-				makeExposureWithVerification(aaa, posver, "AAA", "US"),
-				makeExposureWithVerification(bbb, posver, "AAA", "US"),
-				makeExposureWithVerification(ccc, posver, "BBB", "US"),
-				makeExposureWithVerification(ddd, selfver, "AAA", "US"),
+				makeExposure(aaa, 1, "US"),
+				makeExposure(bbb, 1, "US"),
+				makeExposure(ccc, 2, "US"),
+				makeExposure(ddd, 3, "US"),
 			},
-			want: pb.FederationFetchResponse{
+			want: &pb.FederationFetchResponse{
 				Response: []*pb.ContactTracingResponse{
 					{
 						RegionIdentifiers: []string{"US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, VerificationAuthorityName: "AAA", ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
-							{TransmissionRisk: posver, VerificationAuthorityName: "BBB", ExposureKeys: []*pb.ExposureKey{ccc}},
-							{TransmissionRisk: selfver, VerificationAuthorityName: "AAA", ExposureKeys: []*pb.ExposureKey{ddd}},
+							{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{aaa, bbb}},
+							{TransmissionRisk: 2, ExposureKeys: []*pb.ExposureKey{ccc}},
+							{TransmissionRisk: 3, ExposureKeys: []*pb.ExposureKey{ddd}},
 						},
 					},
 				},
@@ -187,23 +180,23 @@ func TestFetch(t *testing.T) {
 			name:           "exclude regions",
 			excludeRegions: []string{"US", "CA"},
 			iterations: []interface{}{
-				makeExposure(aaa, posver, "US"),
-				makeExposure(bbb, posver, "CA"),
-				makeExposure(ccc, posver, "GB"),
-				makeExposure(ddd, posver, "US", "GB"),
+				makeExposure(aaa, 8, "US"),
+				makeExposure(bbb, 8, "CA"),
+				makeExposure(ccc, 2, "GB"),
+				makeExposure(ddd, 1, "US", "GB"),
 			},
-			want: pb.FederationFetchResponse{
+			want: &pb.FederationFetchResponse{
 				Response: []*pb.ContactTracingResponse{
 					{
 						RegionIdentifiers: []string{"GB"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{ccc}},
+							{TransmissionRisk: 2, ExposureKeys: []*pb.ExposureKey{ccc}},
 						},
 					},
 					{
 						RegionIdentifiers: []string{"GB", "US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{ddd}},
+							{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{ddd}},
 						},
 					},
 				},
@@ -214,33 +207,33 @@ func TestFetch(t *testing.T) {
 			name:           "exclude all regions",
 			excludeRegions: []string{"US", "CA", "GB"},
 			iterations: []interface{}{
-				makeExposure(aaa, posver, "US"),
-				makeExposure(bbb, posver, "CA"),
-				makeExposure(ccc, posver, "GB"),
-				makeExposure(ddd, posver, "US", "CA", "GB"),
+				makeExposure(aaa, 1, "US"),
+				makeExposure(bbb, 1, "CA"),
+				makeExposure(ccc, 1, "GB"),
+				makeExposure(ddd, 1, "US", "CA", "GB"),
 			},
-			want: pb.FederationFetchResponse{},
+			want: &pb.FederationFetchResponse{},
 		},
 		{
 			name: "partial result",
 			iterations: []interface{}{
-				makeExposure(aaa, posver, "US"),
-				makeExposure(bbb, posver, "CA"),
+				makeExposure(aaa, 1, "US"),
+				makeExposure(bbb, 2, "CA"),
 				timeout{},
-				makeExposure(ccc, posver, "GB"),
+				makeExposure(ccc, 3, "GB"),
 			},
-			want: pb.FederationFetchResponse{
+			want: &pb.FederationFetchResponse{
 				Response: []*pb.ContactTracingResponse{
 					{
 						RegionIdentifiers: []string{"US"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{aaa}},
+							{TransmissionRisk: 1, ExposureKeys: []*pb.ExposureKey{aaa}},
 						},
 					},
 					{
 						RegionIdentifiers: []string{"CA"},
 						ContactTracingInfo: []*pb.ContactTracingInfo{
-							{TransmissionRisk: posver, ExposureKeys: []*pb.ExposureKey{bbb}},
+							{TransmissionRisk: 2, ExposureKeys: []*pb.ExposureKey{bbb}},
 						},
 					},
 				},
@@ -256,8 +249,8 @@ func TestFetch(t *testing.T) {
 			ctx := context.Background()
 			env := serverenv.New(ctx)
 			server := Server{env: env}
-			req := pb.FederationFetchRequest{ExcludeRegionIdentifiers: tc.excludeRegions}
-			got, err := server.fetch(context.Background(), &req, iterFunc(tc.iterations), time.Now())
+			req := &pb.FederationFetchRequest{ExcludeRegionIdentifiers: tc.excludeRegions}
+			got, err := server.fetch(context.Background(), req, iterFunc(tc.iterations), time.Now())
 			if err != nil {
 				t.Fatalf("fetch() returned err=%v, want err=nil", err)
 			}
@@ -335,25 +328,25 @@ func TestIntersect(t *testing.T) {
 			name: "empty",
 			aa:   []string{},
 			bb:   []string{},
-			want: []string{},
+			want: nil,
 		},
 		{
 			name: "aa only values",
 			aa:   []string{"1", "2"},
 			bb:   []string{},
-			want: []string{},
+			want: nil,
 		},
 		{
 			name: "bb only values",
 			aa:   []string{},
 			bb:   []string{"1", "2"},
-			want: []string{},
+			want: nil,
 		},
 		{
 			name: "mutually exclusive",
 			aa:   []string{"1", "2"},
 			bb:   []string{"7", "8", "9"},
-			want: []string{},
+			want: nil,
 		},
 		{
 			name: "full overlap",

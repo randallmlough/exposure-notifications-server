@@ -1,43 +1,126 @@
-# Starting the exposure notifications server
+# Starting the exposure notification key server
 
-This is a set of terraform configs which should enable you to bring up a copy of
-the exposure notifications server on GCP.  It makes heavy use of the GCP
-terraform provider, developed at
-https://github.com/terraform-providers/terraform-provider-google.
+This is a set of Terraform configurations which create the required
+infrastructure for an exposure notification key server on Google Cloud. Please note
+that **Terraform is only used for the initial deployment and provisioning of
+underlying infrastructure!** It is not used for continuous delivery or
+continuous deployment.
 
 ## Requirements
 
-Go 1.13 or higher.  [Installation guide](https://golang.org/doc/install),
-although `apt-get install golang` may be all you need.
+- Terraform 0.12. [Installation guide](https://www.terraform.io/downloads.html)
 
-Terraform 0.12.  [Installation guide](https://www.terraform.io/downloads.html),
-although `go get github.com/hashicorp/terraform` may be all you need.
+- gcloud. [Installation guide](https://cloud.google.com/sdk/install)
 
-gcloud.  [Installation guide](https://cloud.google.com/sdk/install), though
-`apt-get install google-cloud-sdk` may work.
+    Note: Make sure you **unset** `GOOGLE_APPLICATION_CREDENTIALS` in your
+    environment:
+
+    ```text
+    unset GOOGLE_APPLICATION_CREDENTIALS
+    ```
 
 ## Instructions
 
-1. Create a GCP project.
-[Instructions](https://cloud.google.com/resource-manager/docs/creating-managing-projects).
-Enable a billing account for this project, and remember its project ID (the
-unique, unchangeable string that you will be asked for during creation).
+For full instructions on deploying, view the [deployment docs](../docs/getting-started/deploying.md)
 
-1. Decide whether or not to use cloud build triggers. If you do, every push to master on the GitHub repo containing
-the exposure server code will trigger a new deployment. To enable this:
+1.  Create a GCP project.
+    [Instructions](https://cloud.google.com/resource-manager/docs/creating-managing-projects).
+    Enable a billing account for this project, and note its project ID (the
+    unique, unchangeable string that you will be asked for during creation):
 
-    1. Visit https://console.cloud.google.com/cloud-build/triggers/connect and follow the instructions to connect as a Cloud Build GitHub App. You must choose a repository that you have admin permissions on.
+    ```text
+    $ export PROJECT_ID="<value-from-above>"
+    ```
 
-    1. Remember which repo you used. You will need to set the repo owner (e.g. 'google') and name (e.g. 'exposure-notifications-server') as variables in the `terraform apply`
+1.  Authenticate to gcloud with:
 
-1. Log in to gcloud using `gcloud auth login && gcloud auth application-default login` (this will open two authentication windows in your web browser).
+    ```text
+    $ gcloud auth login && gcloud auth application-default login
+    ```
 
-1. Change to this directory and run `terraform init`.  Terraform will
-automatically download the plugins required to execute this code.
+    This will open two authentication windows in your web browser.
 
-1. Run `terraform apply -var project=$YOUR_PROJECT_ID_FROM_STEP_1 [-var use_build_triggers=true -var repo_owner=$YOUR_REPO_OWNER -var repo_name=$YOUR_REPO_NAME]`.
+1.  Change into the `terraform/` directory. All future commands are run from the
+    `terraform/` directory:
 
-Terraform will begin by creating the service accounts and enabling the services
-on GCP which are required to run this server.
+    ```text
+    $ cd terraform/
+    ```
 
-It will then create the database and user and apply the DB schema, and run the assorted binaries with everything hooked up.
+1.  Save the project ID as a Terraform variable:
+
+    ```text
+    $ echo "project = ${PROJECT_ID}" >> ./terraform.tfvars
+    ```
+
+1.  (Optional) Enable the data generation job. This is useful for testing
+    environments as it provides a consistent flow of exposure data into the
+    system.
+
+    ```text
+    $ echo 'generate_cron_schedule = "*/15 * * * *"' >> ./terraform.tfvars
+    ```
+
+1.  (Optional, but recommended) Create a Cloud Storage bucket for storing remote
+    state. This is important if you plan to have multiple people running
+    Terraform or collaborating.
+
+    ```text
+    $ gsutil mb -p ${PROJECT_ID} gs://${PROJECT_ID}-tf-state
+    ```
+
+    Configure Terraform to store state in the bucket:
+
+    ```text
+    $ cat <<EOF > ./terraform/state.tf
+    terraform {
+      backend "gcs" {
+        bucket = "${PROJECT_ID}-tf-state"
+      }
+    }
+    EOF
+    ```
+
+1.  Run `terraform init`. Terraform will automatically download the plugins
+    required to execute this code. You only need to do this once per machine.
+
+    ```text
+    $ terraform init
+    ```
+
+1.  Execute Terraform:
+
+    ```text
+    $ terraform apply
+    ```
+
+Terraform will create the required infrastructure including the database,
+service accounts, storage bucket, keys, and secrets. **As a one-time
+operation**, Terraform will also migrate the database schema and build/deploy
+the initial set of services on Cloud Run. Terraform does not manage the
+lifecycle of those resources beyond their initial creation.
+
+### Local development and testing example deployment
+
+The default Terraform deployment is a production-ready, high traffic deployment.
+For local development and testing, you may want to use a less powerful setup:
+
+```hcl
+# terraform/terraform.tfvars
+project               = "..."
+cloudsql_tier         = "db-custom-1-3840"
+cloudsql_disk_size_gb = "16"
+```
+
+### Changing Regions
+
+The target cloud region for each resource types are exposed as Terraform
+variables in `vars.tf`. Each region or location variable may be changed,
+however, they are not necessarily independent. The comments for each variable
+make a note of required dependencies and also link to the associated docs page
+listing the valid values.
+
+Note that not all resources used by this project are currently available in all
+regions, but bringing up infrastructure in different regions needs careful
+consideration as geographic location of resources does impact service
+performance.
